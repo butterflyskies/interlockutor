@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+*']
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag_name: ${{ github.ref_name }}
+      is_prerelease: ${{ contains(github.ref_name, '-') }}
+    steps:
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          prerelease_flag=""
+          if [[ "$TAG_NAME" == *-* ]]; then
+            prerelease_flag="--prerelease"
+          fi
+          gh release create "$TAG_NAME" --draft $prerelease_flag \
+            --title "$TAG_NAME" \
+            --repo "${{ github.repository }}"
+
+  publish-crate:
+    needs: create-release
+    if: ${{ needs.create-release.outputs.is_prerelease != 'true' }}
+    uses: ./.github/workflows/publish-crate.yml
+    with:
+      tag: ${{ needs.create-release.outputs.tag_name }}
+    permissions:
+      id-token: write
+      contents: read
+
+  publish-release:
+    needs: [create-release, publish-crate]
+    if: ${{ always() && needs.create-release.result == 'success' && (needs.publish-crate.result == 'skipped' || needs.publish-crate.result == 'success') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
+        run: |
+          gh release edit "$TAG_NAME" \
+            --draft=false \
+            --repo "${{ github.repository }}"
+
+  update-release-notes:
+    needs: [create-release, publish-release]
+    if: ${{ needs.create-release.outputs.is_prerelease != 'true' }}
+    uses: ./.github/workflows/update-release-notes.yml
+    with:
+      tag: ${{ needs.create-release.outputs.tag_name }}
+    permissions:
+      contents: write
