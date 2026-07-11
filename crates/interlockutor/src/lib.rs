@@ -87,10 +87,12 @@ pub struct WorkAck {
     pub acknowledged_at: Timestamp,
 }
 
+#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     Unauthorized,
     DuplicateEventId,
+    IdempotencyKeyConflict { key: IdempotencyKey },
     OutOfOrderAck { expected: u64, actual: u64 },
     UnknownEvent,
     NotLeaseOwner,
@@ -135,6 +137,11 @@ impl Authorizer for AllowAll {
 ///
 /// Delivery is at-least-once. Effects performed by consumers must therefore be
 /// idempotent. Ordering is guaranteed per topic, never globally.
+///
+/// This synchronous trait is the local/reference contract. Network adapters
+/// should expose their own asynchronous API rather than blocking an async
+/// runtime behind this trait. Retention and compaction are intentionally not
+/// part of the MVP contract; the reference store is unbounded.
 pub trait EventStore: Send + Sync {
     fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error>;
 
@@ -206,12 +213,12 @@ impl MemoryStore {
         }
     }
 
-    fn expiry(&self, duration: Duration) -> Result<Timestamp, Error> {
+    fn expiry_from(now: Timestamp, duration: Duration) -> Result<Timestamp, Error> {
         let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         if millis == 0 {
             return Err(Error::InvalidLeaseDuration);
         }
-        Ok(self.clock.now().saturating_add(millis))
+        Ok(now.saturating_add(millis))
     }
 
     fn validate_lease(state: &State, lease: &Lease, now: Timestamp) -> Result<(), Error> {
@@ -237,6 +244,14 @@ impl EventStore for MemoryStore {
         }
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         if let Some(existing) = state.idempotency.get(&event.idempotency_key) {
+            if existing.id != event.id
+                || existing.topic != event.topic
+                || existing.payload != event.payload
+            {
+                return Err(Error::IdempotencyKeyConflict {
+                    key: event.idempotency_key,
+                });
+            }
             return Ok(AppendOutcome::Existing(existing.clone()));
         }
         if state.event_ids.contains_key(&event.id) {
@@ -341,8 +356,8 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
-        let expires_at = self.expiry(lease_for)?;
         let now = self.clock.now();
+        let expires_at = Self::expiry_from(now, lease_for)?;
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         let events = state.topics.get(topic).cloned().unwrap_or_default();
         for event in events {
@@ -378,8 +393,14 @@ impl EventStore for MemoryStore {
     }
 
     fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error> {
-        let expires_at = self.expiry(lease_for)?;
+        if !self
+            .authorizer
+            .can_consume(&lease.owner, &lease.event.topic)
+        {
+            return Err(Error::Unauthorized);
+        }
         let now = self.clock.now();
+        let expires_at = Self::expiry_from(now, lease_for)?;
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         Self::validate_lease(&state, lease, now)?;
         state
@@ -397,6 +418,12 @@ impl EventStore for MemoryStore {
     }
 
     fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error> {
+        if !self
+            .authorizer
+            .can_consume(&lease.owner, &lease.event.topic)
+        {
+            return Err(Error::Unauthorized);
+        }
         let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         Self::validate_lease(&state, lease, now)?;
@@ -412,6 +439,12 @@ impl EventStore for MemoryStore {
     }
 
     fn nack_work(&self, lease: &Lease) -> Result<(), Error> {
+        if !self
+            .authorizer
+            .can_consume(&lease.owner, &lease.event.topic)
+        {
+            return Err(Error::Unauthorized);
+        }
         let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         Self::validate_lease(&state, lease, now)?;

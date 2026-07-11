@@ -1,5 +1,6 @@
 use super::*;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Barrier;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 #[derive(Default)]
 struct FakeClock(AtomicU64);
@@ -12,6 +13,10 @@ impl Clock for FakeClock {
 impl FakeClock {
     fn advance(&self, ms: u64) {
         self.0.fetch_add(ms, Ordering::SeqCst);
+    }
+
+    fn set(&self, ms: u64) {
+        self.0.store(ms, Ordering::SeqCst);
     }
 }
 
@@ -43,10 +48,31 @@ fn append_is_idempotent_and_order_is_per_topic() {
     let b1 = append(&store, "b1", "b");
     let a2 = append(&store, "a2", "a");
     assert_eq!((a1.sequence, b1.sequence, a2.sequence), (1, 1, 2));
-    assert!(matches!(
+    assert_eq!(
         store.append("p", new("a1", "a")).unwrap(),
-        AppendOutcome::Existing(_)
-    ));
+        AppendOutcome::Existing(a1)
+    );
+}
+
+#[test]
+fn idempotency_key_reuse_for_different_event_is_a_conflict() {
+    let (store, _) = fixture();
+    append(&store, "original", "topic-a");
+
+    let mut conflicting = new("replacement", "topic-b");
+    conflicting.idempotency_key = IdempotencyKey("key-original".into());
+    assert_eq!(
+        store.append("producer", conflicting),
+        Err(Error::IdempotencyKeyConflict {
+            key: IdempotencyKey("key-original".into())
+        })
+    );
+    assert!(
+        store
+            .read_broadcast(&ConsumerId("reader".into()), &Topic("topic-b".into()), 10)
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -65,7 +91,11 @@ fn broadcast_consumers_have_independent_contiguous_cursors() {
             actual: 2
         })
     );
-    store.ack_broadcast(&a, &topic, 1).unwrap();
+    let ack = store.ack_broadcast(&a, &topic, 1).unwrap();
+    assert_eq!(ack.consumer, a);
+    assert_eq!(ack.topic, topic);
+    assert_eq!(ack.sequence, 1);
+    assert_eq!(ack.acknowledged_at, 0);
     assert_eq!(store.read_broadcast(&a, &topic, 10).unwrap()[0].sequence, 2);
     assert_eq!(store.read_broadcast(&b, &topic, 10).unwrap().len(), 2);
 }
@@ -113,6 +143,8 @@ fn renewal_extends_lease_and_nack_requeues_with_new_fence() {
         .unwrap();
     clock.advance(5);
     let renewed = store.renew(&first, Duration::from_millis(20)).unwrap();
+    assert_eq!(renewed.expires_at, 25);
+    assert_eq!(renewed.fence, first.fence);
     clock.advance(10);
     assert_eq!(
         store.claim(&b, &topic, Duration::from_millis(10)).unwrap(),
@@ -124,6 +156,84 @@ fn renewal_extends_lease_and_nack_requeues_with_new_fence() {
         .unwrap()
         .unwrap();
     assert_eq!(second.fence, Fence(2));
+}
+
+#[test]
+fn expired_lease_is_rejected_without_reclaim() {
+    let (store, clock) = fixture();
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .unwrap();
+    clock.advance(10);
+    assert_eq!(store.ack_work(&lease), Err(Error::LeaseExpired));
+    assert_eq!(
+        store.renew(&lease, Duration::from_millis(10)),
+        Err(Error::LeaseExpired)
+    );
+    assert_eq!(store.nack_work(&lease), Err(Error::LeaseExpired));
+}
+
+#[test]
+fn renew_rejects_zero_duration_and_uses_one_clock_read() {
+    let (store, clock) = fixture();
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        store.renew(&lease, Duration::ZERO),
+        Err(Error::InvalidLeaseDuration)
+    );
+    clock.set(3);
+    assert_eq!(
+        store
+            .renew(&lease, Duration::from_millis(20))
+            .unwrap()
+            .expires_at,
+        23
+    );
+}
+
+#[test]
+fn concurrent_claim_race_has_exactly_one_winner() {
+    const WORKERS: usize = 16;
+    let (store, _) = fixture();
+    append(&store, "job", "work");
+    let store = Arc::new(store);
+    let barrier = Arc::new(Barrier::new(WORKERS));
+    let handles: Vec<_> = (0..WORKERS)
+        .map(|index| {
+            let store = store.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                store
+                    .claim(
+                        &ConsumerId(format!("worker-{index}")),
+                        &Topic("work".into()),
+                        Duration::from_secs(1),
+                    )
+                    .unwrap()
+            })
+        })
+        .collect();
+    let winners = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .filter(Option::is_some)
+        .count();
+    assert_eq!(winners, 1);
 }
 
 #[test]
@@ -188,6 +298,29 @@ impl Authorizer for DenyAll {
     }
 }
 
+#[derive(Default)]
+struct ToggleAuthorizer(AtomicBool);
+
+impl ToggleAuthorizer {
+    fn allow(&self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+
+    fn deny(&self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Authorizer for ToggleAuthorizer {
+    fn can_publish(&self, _: &str, _: &Topic) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn can_consume(&self, _: &ConsumerId, _: &Topic) -> bool {
+        self.0.load(Ordering::SeqCst)
+    }
+}
+
 #[test]
 fn authorization_is_enforced_at_publish_and_consume_boundaries() {
     let clock = Arc::new(FakeClock::default());
@@ -198,6 +331,46 @@ fn authorization_is_enforced_at_publish_and_consume_boundaries() {
     );
     assert_eq!(
         store.read_broadcast(&ConsumerId("worker".into()), &Topic("work".into()), 1),
+        Err(Error::Unauthorized)
+    );
+}
+
+#[test]
+fn authorization_revocation_blocks_all_lease_verbs() {
+    let clock = Arc::new(FakeClock::default());
+    let auth = Arc::new(ToggleAuthorizer::default());
+    auth.allow();
+    let store = MemoryStore::new(clock, auth.clone());
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    auth.deny();
+    assert_eq!(
+        store.read_broadcast(&lease.owner, &lease.event.topic, 1),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.ack_broadcast(&lease.owner, &lease.event.topic, 1),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.renew(&lease, Duration::from_secs(1)),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(store.ack_work(&lease), Err(Error::Unauthorized));
+    assert_eq!(store.nack_work(&lease), Err(Error::Unauthorized));
+    assert_eq!(
+        store.claim(
+            &ConsumerId("other".into()),
+            &Topic("work".into()),
+            Duration::from_secs(1)
+        ),
         Err(Error::Unauthorized)
     );
 }
