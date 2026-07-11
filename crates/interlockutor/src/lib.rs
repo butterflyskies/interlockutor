@@ -1,0 +1,428 @@
+//! Neutral primitives for durable broadcast delivery and leased work queues.
+//!
+//! The reference [`MemoryStore`] is deliberately process-local. Persistent and
+//! distributed backends implement [`EventStore`] and must pass the same
+//! conformance suite.
+
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+/// Monotonic time in milliseconds from an implementation-defined epoch.
+pub type Timestamp = u64;
+
+/// A stable identifier supplied by the producer.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct EventId(pub String);
+
+/// A routing name. Ordering is guaranteed independently within each topic.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Topic(pub String);
+
+/// An opaque consumer identity.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ConsumerId(pub String);
+
+/// An idempotency key stable across producer retries.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IdempotencyKey(pub String);
+
+/// A producer-authored event before it is appended.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewEvent {
+    pub id: EventId,
+    pub topic: Topic,
+    pub idempotency_key: IdempotencyKey,
+    pub payload: Vec<u8>,
+}
+
+/// An event assigned a per-topic sequence by the store.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Event {
+    pub id: EventId,
+    pub topic: Topic,
+    pub idempotency_key: IdempotencyKey,
+    pub payload: Vec<u8>,
+    /// One-based, contiguous, and monotonic within `topic`.
+    pub sequence: u64,
+    pub appended_at: Timestamp,
+}
+
+/// Result of an idempotent append.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AppendOutcome {
+    Appended(Event),
+    Existing(Event),
+}
+
+/// Receipt proving that one broadcast cursor advanced.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BroadcastAck {
+    pub consumer: ConsumerId,
+    pub topic: Topic,
+    pub sequence: u64,
+    pub acknowledged_at: Timestamp,
+}
+
+/// A fencing token. A higher value supersedes every lower value for the item.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct Fence(pub u64);
+
+/// A temporary, renewable right to execute a work item.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Lease {
+    pub event: Event,
+    pub owner: ConsumerId,
+    pub fence: Fence,
+    pub expires_at: Timestamp,
+}
+
+/// Final acknowledgement of work under a current lease.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkAck {
+    pub event_id: EventId,
+    pub owner: ConsumerId,
+    pub fence: Fence,
+    pub acknowledged_at: Timestamp,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    Unauthorized,
+    DuplicateEventId,
+    OutOfOrderAck { expected: u64, actual: u64 },
+    UnknownEvent,
+    NotLeaseOwner,
+    StaleFence,
+    LeaseExpired,
+    InvalidLeaseDuration,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{self:?}")
+    }
+}
+
+impl std::error::Error for Error {}
+
+/// Injected monotonic clock. Backends must not read wall time directly.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> Timestamp;
+}
+
+/// Policy seam. The core assigns no meaning to principals or topics.
+pub trait Authorizer: Send + Sync {
+    fn can_publish(&self, producer: &str, topic: &Topic) -> bool;
+    fn can_consume(&self, consumer: &ConsumerId, topic: &Topic) -> bool;
+}
+
+/// Permissive policy useful for local and conformance testing.
+#[derive(Debug, Default)]
+pub struct AllowAll;
+
+impl Authorizer for AllowAll {
+    fn can_publish(&self, _: &str, _: &Topic) -> bool {
+        true
+    }
+    fn can_consume(&self, _: &ConsumerId, _: &Topic) -> bool {
+        true
+    }
+}
+
+/// Storage contract shared by local and future durable implementations.
+///
+/// Delivery is at-least-once. Effects performed by consumers must therefore be
+/// idempotent. Ordering is guaranteed per topic, never globally.
+pub trait EventStore: Send + Sync {
+    fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error>;
+
+    fn read_broadcast(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        limit: usize,
+    ) -> Result<Vec<Event>, Error>;
+
+    /// Advances only over the next event, making cursor gaps explicit.
+    fn ack_broadcast(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        sequence: u64,
+    ) -> Result<BroadcastAck, Error>;
+
+    fn claim(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        lease_for: Duration,
+    ) -> Result<Option<Lease>, Error>;
+
+    fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error>;
+    fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error>;
+
+    /// Releases work immediately. The next claim receives a higher fence.
+    fn nack_work(&self, lease: &Lease) -> Result<(), Error>;
+}
+
+#[derive(Clone)]
+pub struct MemoryStore {
+    clock: Arc<dyn Clock>,
+    authorizer: Arc<dyn Authorizer>,
+    state: Arc<Mutex<State>>,
+}
+
+#[derive(Default)]
+struct State {
+    topics: BTreeMap<Topic, Vec<Event>>,
+    idempotency: HashMap<IdempotencyKey, Event>,
+    event_ids: HashMap<EventId, IdempotencyKey>,
+    cursors: HashMap<(ConsumerId, Topic), u64>,
+    work: HashMap<EventId, WorkState>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct WorkState {
+    fence: u64,
+    lease: Option<LeaseState>,
+    acknowledged: bool,
+}
+
+#[derive(Clone, Debug)]
+struct LeaseState {
+    owner: ConsumerId,
+    fence: Fence,
+    expires_at: Timestamp,
+}
+
+impl MemoryStore {
+    pub fn new(clock: Arc<dyn Clock>, authorizer: Arc<dyn Authorizer>) -> Self {
+        Self {
+            clock,
+            authorizer,
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+
+    fn expiry(&self, duration: Duration) -> Result<Timestamp, Error> {
+        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        if millis == 0 {
+            return Err(Error::InvalidLeaseDuration);
+        }
+        Ok(self.clock.now().saturating_add(millis))
+    }
+
+    fn validate_lease(state: &State, lease: &Lease, now: Timestamp) -> Result<(), Error> {
+        let work = state.work.get(&lease.event.id).ok_or(Error::UnknownEvent)?;
+        let active = work.lease.as_ref().ok_or(Error::NotLeaseOwner)?;
+        if active.fence != lease.fence {
+            return Err(Error::StaleFence);
+        }
+        if active.owner != lease.owner {
+            return Err(Error::NotLeaseOwner);
+        }
+        if active.expires_at <= now {
+            return Err(Error::LeaseExpired);
+        }
+        Ok(())
+    }
+}
+
+impl EventStore for MemoryStore {
+    fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error> {
+        if !self.authorizer.can_publish(producer, &event.topic) {
+            return Err(Error::Unauthorized);
+        }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        if let Some(existing) = state.idempotency.get(&event.idempotency_key) {
+            return Ok(AppendOutcome::Existing(existing.clone()));
+        }
+        if state.event_ids.contains_key(&event.id) {
+            return Err(Error::DuplicateEventId);
+        }
+        let sequence = state
+            .topics
+            .get(&event.topic)
+            .map_or(1, |events| events.len() as u64 + 1);
+        let stored = Event {
+            id: event.id.clone(),
+            topic: event.topic.clone(),
+            idempotency_key: event.idempotency_key.clone(),
+            payload: event.payload,
+            sequence,
+            appended_at: self.clock.now(),
+        };
+        state
+            .event_ids
+            .insert(stored.id.clone(), stored.idempotency_key.clone());
+        state
+            .idempotency
+            .insert(stored.idempotency_key.clone(), stored.clone());
+        state.work.insert(stored.id.clone(), WorkState::default());
+        state
+            .topics
+            .entry(stored.topic.clone())
+            .or_default()
+            .push(stored.clone());
+        Ok(AppendOutcome::Appended(stored))
+    }
+
+    fn read_broadcast(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        limit: usize,
+    ) -> Result<Vec<Event>, Error> {
+        if !self.authorizer.can_consume(consumer, topic) {
+            return Err(Error::Unauthorized);
+        }
+        let state = self.state.lock().expect("memory store mutex poisoned");
+        let cursor = state
+            .cursors
+            .get(&(consumer.clone(), topic.clone()))
+            .copied()
+            .unwrap_or(0);
+        Ok(state
+            .topics
+            .get(topic)
+            .into_iter()
+            .flatten()
+            .filter(|e| e.sequence > cursor)
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
+    fn ack_broadcast(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        sequence: u64,
+    ) -> Result<BroadcastAck, Error> {
+        if !self.authorizer.can_consume(consumer, topic) {
+            return Err(Error::Unauthorized);
+        }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let exists = state
+            .topics
+            .get(topic)
+            .is_some_and(|events| events.iter().any(|e| e.sequence == sequence));
+        if !exists {
+            return Err(Error::UnknownEvent);
+        }
+        let cursor = state
+            .cursors
+            .entry((consumer.clone(), topic.clone()))
+            .or_insert(0);
+        let expected = *cursor + 1;
+        if sequence != expected {
+            return Err(Error::OutOfOrderAck {
+                expected,
+                actual: sequence,
+            });
+        }
+        *cursor = sequence;
+        Ok(BroadcastAck {
+            consumer: consumer.clone(),
+            topic: topic.clone(),
+            sequence,
+            acknowledged_at: self.clock.now(),
+        })
+    }
+
+    fn claim(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        lease_for: Duration,
+    ) -> Result<Option<Lease>, Error> {
+        if !self.authorizer.can_consume(consumer, topic) {
+            return Err(Error::Unauthorized);
+        }
+        let expires_at = self.expiry(lease_for)?;
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let events = state.topics.get(topic).cloned().unwrap_or_default();
+        for event in events {
+            let work = state
+                .work
+                .get_mut(&event.id)
+                .expect("work state exists for event");
+            if work.acknowledged {
+                continue;
+            }
+            if work
+                .lease
+                .as_ref()
+                .is_some_and(|lease| lease.expires_at > now)
+            {
+                continue;
+            }
+            work.fence = work.fence.checked_add(1).expect("fencing token exhausted");
+            let fence = Fence(work.fence);
+            work.lease = Some(LeaseState {
+                owner: consumer.clone(),
+                fence,
+                expires_at,
+            });
+            return Ok(Some(Lease {
+                event,
+                owner: consumer.clone(),
+                fence,
+                expires_at,
+            }));
+        }
+        Ok(None)
+    }
+
+    fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error> {
+        let expires_at = self.expiry(lease_for)?;
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        Self::validate_lease(&state, lease, now)?;
+        state
+            .work
+            .get_mut(&lease.event.id)
+            .expect("validated")
+            .lease
+            .as_mut()
+            .expect("validated")
+            .expires_at = expires_at;
+        Ok(Lease {
+            expires_at,
+            ..lease.clone()
+        })
+    }
+
+    fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error> {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        Self::validate_lease(&state, lease, now)?;
+        let work = state.work.get_mut(&lease.event.id).expect("validated");
+        work.acknowledged = true;
+        work.lease = None;
+        Ok(WorkAck {
+            event_id: lease.event.id.clone(),
+            owner: lease.owner.clone(),
+            fence: lease.fence,
+            acknowledged_at: now,
+        })
+    }
+
+    fn nack_work(&self, lease: &Lease) -> Result<(), Error> {
+        let now = self.clock.now();
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        Self::validate_lease(&state, lease, now)?;
+        state
+            .work
+            .get_mut(&lease.event.id)
+            .expect("validated")
+            .lease = None;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests;
