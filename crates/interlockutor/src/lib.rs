@@ -222,6 +222,14 @@ impl MemoryStore {
     }
 
     fn validate_lease(state: &State, lease: &Lease, now: Timestamp) -> Result<(), Error> {
+        let key = state
+            .event_ids
+            .get(&lease.event.id)
+            .ok_or(Error::UnknownEvent)?;
+        let canonical = state.idempotency.get(key).ok_or(Error::UnknownEvent)?;
+        if canonical != &lease.event {
+            return Err(Error::UnknownEvent);
+        }
         let work = state.work.get(&lease.event.id).ok_or(Error::UnknownEvent)?;
         let active = work.lease.as_ref().ok_or(Error::NotLeaseOwner)?;
         if active.fence != lease.fence {

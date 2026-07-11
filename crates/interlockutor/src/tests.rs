@@ -374,3 +374,19 @@ fn authorization_revocation_blocks_all_lease_verbs() {
         Err(Error::Unauthorized)
     );
 }
+
+#[test]
+fn lease_event_cannot_be_forged_to_change_its_topic() {
+    let (store, _) = fixture();
+    append(&store, "job", "work");
+    let mut lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .unwrap();
+    lease.event.topic = Topic("different".into());
+    assert_eq!(store.ack_work(&lease), Err(Error::UnknownEvent));
+}
