@@ -3,11 +3,17 @@
 //! The reference [`MemoryStore`] is deliberately process-local. Persistent and
 //! distributed backends implement [`EventStore`] and must pass the same
 //! conformance suite.
+//!
+//! # Migrating from 0.1
+//!
+//! Version 0.2 replaces raw `Vec<u8>` event payloads with [`Payload`] and
+//! changes [`MemoryStore::new`] to accept only an authorizer. Tests and custom
+//! backends that inject a clock should use [`MemoryStore::with_clock`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Monotonic time in milliseconds from an implementation-defined epoch.
 pub type Timestamp = u64;
@@ -28,13 +34,80 @@ pub struct ConsumerId(pub String);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IdempotencyKey(pub String);
 
+/// Opaque event data.
+///
+/// Producers can supply already-encoded bytes with [`Payload::from_bytes`] or
+/// serialize a value as JSON with [`Payload::json`]. Interlockutor deliberately
+/// does not prescribe one encoding for every event in a topic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payload(Vec<u8>);
+
+impl Payload {
+    /// Wraps an encoded payload without changing its bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Serializes a value as JSON.
+    pub fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Self, PayloadError> {
+        serde_json::to_vec(value)
+            .map(Self)
+            .map_err(PayloadError::Json)
+    }
+
+    /// Borrows the encoded bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the owned encoded bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Failure to encode a typed value as an event payload.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PayloadError {
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json(error) => write!(f, "failed to serialize payload as JSON: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PayloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(error) => Some(error),
+        }
+    }
+}
+
 /// A producer-authored event before it is appended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewEvent {
     pub id: EventId,
     pub topic: Topic,
     pub idempotency_key: IdempotencyKey,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
 }
 
 /// An event assigned a per-topic sequence by the store.
@@ -43,7 +116,7 @@ pub struct Event {
     pub id: EventId,
     pub topic: Topic,
     pub idempotency_key: IdempotencyKey,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
     /// One-based, contiguous, and monotonic within `topic`.
     pub sequence: u64,
     pub appended_at: Timestamp,
@@ -110,8 +183,35 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Injected monotonic clock. Backends must not read wall time directly.
+///
+/// [`MemoryStore`] samples its clock while holding the state lock so lease
+/// decisions use the authoritative time at the state transition. Clock
+/// implementations must therefore be fast and must not re-enter the store.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
+}
+
+/// Process-monotonic clock used by the reference store.
+///
+/// Timestamps are milliseconds since this clock was created, not wall-clock
+/// timestamps and not values clients should generate or compare remotely.
+#[derive(Debug)]
+struct MonotonicClock {
+    origin: Instant,
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Timestamp {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
 }
 
 /// Policy seam. The core assigns no meaning to principals or topics.
@@ -140,8 +240,10 @@ impl Authorizer for AllowAll {
 ///
 /// This synchronous trait is the local/reference contract. Network adapters
 /// should expose their own asynchronous API rather than blocking an async
-/// runtime behind this trait. Retention and compaction are intentionally not
-/// part of the MVP contract; the reference store is unbounded.
+/// runtime behind this trait. The central store owns lease time; distributed
+/// clients request durations but never supply timestamps or clocks. Retention
+/// and compaction are intentionally not part of the MVP contract; the reference
+/// store is unbounded.
 pub trait EventStore: Send + Sync {
     fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error>;
 
@@ -205,7 +307,13 @@ struct LeaseState {
 }
 
 impl MemoryStore {
-    pub fn new(clock: Arc<dyn Clock>, authorizer: Arc<dyn Authorizer>) -> Self {
+    /// Creates a store with a process-monotonic clock and explicit policy.
+    pub fn new(authorizer: Arc<dyn Authorizer>) -> Self {
+        Self::with_clock(Arc::new(MonotonicClock::default()), authorizer)
+    }
+
+    /// Creates a store with an injected clock, primarily for deterministic tests.
+    pub fn with_clock(clock: Arc<dyn Clock>, authorizer: Arc<dyn Authorizer>) -> Self {
         Self {
             clock,
             authorizer,
@@ -364,9 +472,9 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let events = state.topics.get(topic).cloned().unwrap_or_default();
         for event in events {
             let work = state
@@ -407,9 +515,9 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
         Self::validate_lease(&state, lease, now)?;
         state
             .work
@@ -432,8 +540,8 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         let work = state.work.get_mut(&lease.event.id).expect("validated");
         work.acknowledged = true;
@@ -453,8 +561,8 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         state
             .work

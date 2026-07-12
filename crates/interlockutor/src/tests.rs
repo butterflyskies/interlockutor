@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Barrier, Mutex};
 
 #[derive(Default)]
 struct FakeClock(AtomicU64);
@@ -20,9 +20,47 @@ impl FakeClock {
     }
 }
 
+struct LockAssertingClock {
+    state: Arc<Mutex<State>>,
+    now: AtomicU64,
+}
+
+impl Clock for LockAssertingClock {
+    fn now(&self) -> Timestamp {
+        assert!(
+            self.state.try_lock().is_err(),
+            "clock was sampled before acquiring the contended state lock"
+        );
+        self.now.load(Ordering::SeqCst)
+    }
+}
+
+impl LockAssertingClock {
+    fn set(&self, now: Timestamp) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+}
+
+fn lock_asserting_fixture() -> (MemoryStore, Arc<LockAssertingClock>) {
+    let state = Arc::new(Mutex::new(State::default()));
+    let clock = Arc::new(LockAssertingClock {
+        state: state.clone(),
+        now: AtomicU64::new(0),
+    });
+    let store = MemoryStore {
+        clock: clock.clone(),
+        authorizer: Arc::new(AllowAll),
+        state,
+    };
+    (store, clock)
+}
+
 fn fixture() -> (MemoryStore, Arc<FakeClock>) {
     let clock = Arc::new(FakeClock::default());
-    (MemoryStore::new(clock.clone(), Arc::new(AllowAll)), clock)
+    (
+        MemoryStore::with_clock(clock.clone(), Arc::new(AllowAll)),
+        clock,
+    )
 }
 
 fn new(id: &str, topic: &str) -> NewEvent {
@@ -30,7 +68,7 @@ fn new(id: &str, topic: &str) -> NewEvent {
         id: EventId(id.into()),
         topic: Topic(topic.into()),
         idempotency_key: IdempotencyKey(format!("key-{id}")),
-        payload: id.as_bytes().to_vec(),
+        payload: Payload::from_bytes(id.as_bytes().to_vec()),
     }
 }
 
@@ -52,6 +90,81 @@ fn append_is_idempotent_and_order_is_per_topic() {
         store.append("p", new("a1", "a")).unwrap(),
         AppendOutcome::Existing(a1)
     );
+}
+
+#[test]
+fn payload_json_serializes_compact_bytes() {
+    #[derive(serde::Serialize)]
+    struct Message<'a> {
+        kind: &'a str,
+        count: u8,
+    }
+
+    let payload = Payload::json(&Message {
+        kind: "ready",
+        count: 2,
+    })
+    .unwrap();
+
+    assert_eq!(payload.as_bytes(), br#"{"kind":"ready","count":2}"#);
+
+    let decoded: serde_json::Value = serde_json::from_slice(payload.as_bytes()).unwrap();
+    assert_eq!(decoded, serde_json::json!({"kind": "ready", "count": 2}));
+}
+
+#[test]
+fn payload_json_accepts_unsized_root_values() {
+    assert_eq!(Payload::json("ready").unwrap().as_bytes(), br#""ready""#);
+    assert_eq!(
+        Payload::json(&[1_u8, 2, 3][..]).unwrap().as_bytes(),
+        b"[1,2,3]"
+    );
+}
+
+#[test]
+fn payload_json_preserves_serialization_failure_source() {
+    struct Fails;
+
+    impl serde::Serialize for Fails {
+        fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("intentional test failure"))
+        }
+    }
+
+    let error = Payload::json(&Fails).unwrap_err();
+    assert!(matches!(error, PayloadError::Json(_)));
+    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.to_string().contains("intentional test failure"));
+}
+
+#[test]
+fn payload_raw_bytes_round_trip_unchanged() {
+    let bytes = vec![0, 0xff, 0x80, 1];
+    let payload = Payload::from_bytes(bytes.clone());
+
+    assert_eq!(payload.as_bytes(), bytes.as_slice());
+    assert_eq!(payload.into_bytes(), bytes);
+}
+
+#[test]
+fn default_clock_supports_claim_and_renew_without_client_time() {
+    let store = MemoryStore::new(Arc::new(AllowAll));
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    let renewed = store.renew(&lease, Duration::from_secs(60)).unwrap();
+
+    assert_eq!(renewed.fence, lease.fence);
+    assert!(renewed.expires_at >= lease.expires_at);
 }
 
 #[test]
@@ -128,6 +241,31 @@ fn claim_is_exclusive_until_expiry_then_fence_increases() {
         store.claim(&a, &topic, Duration::from_millis(10)).unwrap(),
         None
     );
+}
+
+#[test]
+fn lease_transitions_sample_authoritative_time_under_the_state_lock() {
+    let (store, clock) = lock_asserting_fixture();
+    let event = append(&store, "job", "work");
+    let consumer = ConsumerId("worker".into());
+    let topic = Topic("work".into());
+
+    let first = store
+        .claim(&consumer, &topic, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let renewed = store.renew(&first, Duration::from_millis(20)).unwrap();
+    store.nack_work(&renewed).unwrap();
+
+    clock.set(10);
+    let second = store
+        .claim(&consumer, &topic, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let ack = store.ack_work(&second).unwrap();
+
+    assert_eq!(second.event, event);
+    assert_eq!(ack.acknowledged_at, 10);
 }
 
 #[test]
@@ -324,7 +462,7 @@ impl Authorizer for ToggleAuthorizer {
 #[test]
 fn authorization_is_enforced_at_publish_and_consume_boundaries() {
     let clock = Arc::new(FakeClock::default());
-    let store = MemoryStore::new(clock, Arc::new(DenyAll));
+    let store = MemoryStore::with_clock(clock, Arc::new(DenyAll));
     assert_eq!(
         store.append("producer", new("job", "work")),
         Err(Error::Unauthorized)
@@ -340,7 +478,7 @@ fn authorization_revocation_blocks_all_lease_verbs() {
     let clock = Arc::new(FakeClock::default());
     let auth = Arc::new(ToggleAuthorizer::default());
     auth.allow();
-    let store = MemoryStore::new(clock, auth.clone());
+    let store = MemoryStore::with_clock(clock, auth.clone());
     append(&store, "job", "work");
     let lease = store
         .claim(
