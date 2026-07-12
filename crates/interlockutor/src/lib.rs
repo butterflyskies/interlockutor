@@ -177,6 +177,10 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {}
 
 /// Injected monotonic clock. Backends must not read wall time directly.
+///
+/// [`MemoryStore`] samples its clock while holding the state lock so lease
+/// decisions use the authoritative time at the state transition. Clock
+/// implementations must therefore be fast and must not re-enter the store.
 pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
 }
@@ -462,9 +466,9 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let events = state.topics.get(topic).cloned().unwrap_or_default();
         for event in events {
             let work = state
@@ -505,9 +509,9 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
+        let mut state = self.state.lock().expect("memory store mutex poisoned");
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
         Self::validate_lease(&state, lease, now)?;
         state
             .work
@@ -530,8 +534,8 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         let work = state.work.get_mut(&lease.event.id).expect("validated");
         work.acknowledged = true;
@@ -551,8 +555,8 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let now = self.clock.now();
         let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         state
             .work

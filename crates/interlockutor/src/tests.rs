@@ -1,6 +1,6 @@
 use super::*;
-use std::sync::Barrier;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Barrier, Mutex};
 
 #[derive(Default)]
 struct FakeClock(AtomicU64);
@@ -18,6 +18,41 @@ impl FakeClock {
     fn set(&self, ms: u64) {
         self.0.store(ms, Ordering::SeqCst);
     }
+}
+
+struct LockAssertingClock {
+    state: Arc<Mutex<State>>,
+    now: AtomicU64,
+}
+
+impl Clock for LockAssertingClock {
+    fn now(&self) -> Timestamp {
+        assert!(
+            self.state.try_lock().is_err(),
+            "clock was sampled before acquiring the contended state lock"
+        );
+        self.now.load(Ordering::SeqCst)
+    }
+}
+
+impl LockAssertingClock {
+    fn set(&self, now: Timestamp) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+}
+
+fn lock_asserting_fixture() -> (MemoryStore, Arc<LockAssertingClock>) {
+    let state = Arc::new(Mutex::new(State::default()));
+    let clock = Arc::new(LockAssertingClock {
+        state: state.clone(),
+        now: AtomicU64::new(0),
+    });
+    let store = MemoryStore {
+        clock: clock.clone(),
+        authorizer: Arc::new(AllowAll),
+        state,
+    };
+    (store, clock)
 }
 
 fn fixture() -> (MemoryStore, Arc<FakeClock>) {
@@ -175,6 +210,31 @@ fn claim_is_exclusive_until_expiry_then_fence_increases() {
         store.claim(&a, &topic, Duration::from_millis(10)).unwrap(),
         None
     );
+}
+
+#[test]
+fn lease_transitions_sample_authoritative_time_under_the_state_lock() {
+    let (store, clock) = lock_asserting_fixture();
+    let event = append(&store, "job", "work");
+    let consumer = ConsumerId("worker".into());
+    let topic = Topic("work".into());
+
+    let first = store
+        .claim(&consumer, &topic, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let renewed = store.renew(&first, Duration::from_millis(20)).unwrap();
+    store.nack_work(&renewed).unwrap();
+
+    clock.set(10);
+    let second = store
+        .claim(&consumer, &topic, Duration::from_millis(10))
+        .unwrap()
+        .unwrap();
+    let ack = store.ack_work(&second).unwrap();
+
+    assert_eq!(second.event, event);
+    assert_eq!(ack.acknowledged_at, 10);
 }
 
 #[test]
