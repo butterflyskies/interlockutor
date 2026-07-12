@@ -7,7 +7,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Monotonic time in milliseconds from an implementation-defined epoch.
 pub type Timestamp = u64;
@@ -28,13 +28,80 @@ pub struct ConsumerId(pub String);
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct IdempotencyKey(pub String);
 
+/// Opaque event data.
+///
+/// Producers can supply already-encoded bytes with [`Payload::from_bytes`] or
+/// serialize a value as JSON with [`Payload::json`]. Interlockutor deliberately
+/// does not prescribe one encoding for every event in a topic.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Payload(Vec<u8>);
+
+impl Payload {
+    /// Wraps an encoded payload without changing its bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self(bytes)
+    }
+
+    /// Serializes a value as JSON.
+    pub fn json<T: serde::Serialize>(value: &T) -> Result<Self, PayloadError> {
+        serde_json::to_vec(value)
+            .map(Self)
+            .map_err(PayloadError::Json)
+    }
+
+    /// Borrows the encoded bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.0
+    }
+
+    /// Returns the owned encoded bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.0
+    }
+}
+
+impl From<Vec<u8>> for Payload {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::from_bytes(bytes)
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+/// Failure to encode a typed value as an event payload.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PayloadError {
+    Json(serde_json::Error),
+}
+
+impl fmt::Display for PayloadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Json(error) => write!(f, "failed to serialize payload as JSON: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for PayloadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Json(error) => Some(error),
+        }
+    }
+}
+
 /// A producer-authored event before it is appended.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewEvent {
     pub id: EventId,
     pub topic: Topic,
     pub idempotency_key: IdempotencyKey,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
 }
 
 /// An event assigned a per-topic sequence by the store.
@@ -43,7 +110,7 @@ pub struct Event {
     pub id: EventId,
     pub topic: Topic,
     pub idempotency_key: IdempotencyKey,
-    pub payload: Vec<u8>,
+    pub payload: Payload,
     /// One-based, contiguous, and monotonic within `topic`.
     pub sequence: u64,
     pub appended_at: Timestamp,
@@ -114,6 +181,29 @@ pub trait Clock: Send + Sync {
     fn now(&self) -> Timestamp;
 }
 
+/// Process-monotonic clock used by the reference store.
+///
+/// Timestamps are milliseconds since this clock was created, not wall-clock
+/// timestamps and not values clients should generate or compare remotely.
+#[derive(Debug)]
+struct MonotonicClock {
+    origin: Instant,
+}
+
+impl Default for MonotonicClock {
+    fn default() -> Self {
+        Self {
+            origin: Instant::now(),
+        }
+    }
+}
+
+impl Clock for MonotonicClock {
+    fn now(&self) -> Timestamp {
+        u64::try_from(self.origin.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
 /// Policy seam. The core assigns no meaning to principals or topics.
 pub trait Authorizer: Send + Sync {
     fn can_publish(&self, producer: &str, topic: &Topic) -> bool;
@@ -140,8 +230,10 @@ impl Authorizer for AllowAll {
 ///
 /// This synchronous trait is the local/reference contract. Network adapters
 /// should expose their own asynchronous API rather than blocking an async
-/// runtime behind this trait. Retention and compaction are intentionally not
-/// part of the MVP contract; the reference store is unbounded.
+/// runtime behind this trait. The central store owns lease time; distributed
+/// clients request durations but never supply timestamps or clocks. Retention
+/// and compaction are intentionally not part of the MVP contract; the reference
+/// store is unbounded.
 pub trait EventStore: Send + Sync {
     fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error>;
 
@@ -205,7 +297,13 @@ struct LeaseState {
 }
 
 impl MemoryStore {
-    pub fn new(clock: Arc<dyn Clock>, authorizer: Arc<dyn Authorizer>) -> Self {
+    /// Creates a store with a process-monotonic clock and explicit policy.
+    pub fn new(authorizer: Arc<dyn Authorizer>) -> Self {
+        Self::with_clock(Arc::new(MonotonicClock::default()), authorizer)
+    }
+
+    /// Creates a store with an injected clock, primarily for deterministic tests.
+    pub fn with_clock(clock: Arc<dyn Clock>, authorizer: Arc<dyn Authorizer>) -> Self {
         Self {
             clock,
             authorizer,

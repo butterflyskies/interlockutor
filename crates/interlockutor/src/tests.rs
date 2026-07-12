@@ -22,7 +22,10 @@ impl FakeClock {
 
 fn fixture() -> (MemoryStore, Arc<FakeClock>) {
     let clock = Arc::new(FakeClock::default());
-    (MemoryStore::new(clock.clone(), Arc::new(AllowAll)), clock)
+    (
+        MemoryStore::with_clock(clock.clone(), Arc::new(AllowAll)),
+        clock,
+    )
 }
 
 fn new(id: &str, topic: &str) -> NewEvent {
@@ -30,7 +33,7 @@ fn new(id: &str, topic: &str) -> NewEvent {
         id: EventId(id.into()),
         topic: Topic(topic.into()),
         idempotency_key: IdempotencyKey(format!("key-{id}")),
-        payload: id.as_bytes().to_vec(),
+        payload: Payload::from_bytes(id.as_bytes().to_vec()),
     }
 }
 
@@ -52,6 +55,50 @@ fn append_is_idempotent_and_order_is_per_topic() {
         store.append("p", new("a1", "a")).unwrap(),
         AppendOutcome::Existing(a1)
     );
+}
+
+#[test]
+fn payload_json_serializes_compact_bytes() {
+    #[derive(serde::Serialize)]
+    struct Message<'a> {
+        kind: &'a str,
+        count: u8,
+    }
+
+    let payload = Payload::json(&Message {
+        kind: "ready",
+        count: 2,
+    })
+    .unwrap();
+
+    assert_eq!(payload.as_bytes(), br#"{"kind":"ready","count":2}"#);
+}
+
+#[test]
+fn payload_raw_bytes_round_trip_unchanged() {
+    let bytes = vec![0, 0xff, 0x80, 1];
+    let payload = Payload::from_bytes(bytes.clone());
+
+    assert_eq!(payload.as_bytes(), bytes.as_slice());
+    assert_eq!(payload.into_bytes(), bytes);
+}
+
+#[test]
+fn default_clock_supports_claim_and_renew_without_client_time() {
+    let store = MemoryStore::new(Arc::new(AllowAll));
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_secs(60),
+        )
+        .unwrap()
+        .unwrap();
+    let renewed = store.renew(&lease, Duration::from_secs(60)).unwrap();
+
+    assert_eq!(renewed.fence, lease.fence);
+    assert!(renewed.expires_at >= lease.expires_at);
 }
 
 #[test]
@@ -324,7 +371,7 @@ impl Authorizer for ToggleAuthorizer {
 #[test]
 fn authorization_is_enforced_at_publish_and_consume_boundaries() {
     let clock = Arc::new(FakeClock::default());
-    let store = MemoryStore::new(clock, Arc::new(DenyAll));
+    let store = MemoryStore::with_clock(clock, Arc::new(DenyAll));
     assert_eq!(
         store.append("producer", new("job", "work")),
         Err(Error::Unauthorized)
@@ -340,7 +387,7 @@ fn authorization_revocation_blocks_all_lease_verbs() {
     let clock = Arc::new(FakeClock::default());
     let auth = Arc::new(ToggleAuthorizer::default());
     auth.allow();
-    let store = MemoryStore::new(clock, auth.clone());
+    let store = MemoryStore::with_clock(clock, auth.clone());
     append(&store, "job", "work");
     let lease = store
         .claim(
