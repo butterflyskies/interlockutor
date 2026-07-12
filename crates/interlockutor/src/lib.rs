@@ -3,6 +3,12 @@
 //! The reference [`MemoryStore`] is deliberately process-local. Persistent and
 //! distributed backends implement [`EventStore`] and must pass the same
 //! conformance suite.
+//!
+//! # Migrating from 0.1
+//!
+//! Version 0.2 replaces raw `Vec<u8>` event payloads with [`Payload`] and
+//! changes [`MemoryStore::new`] to accept only an authorizer. Tests and custom
+//! backends that inject a clock should use [`MemoryStore::with_clock`].
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -43,7 +49,7 @@ impl Payload {
     }
 
     /// Serializes a value as JSON.
-    pub fn json<T: serde::Serialize>(value: &T) -> Result<Self, PayloadError> {
+    pub fn json<T: serde::Serialize + ?Sized>(value: &T) -> Result<Self, PayloadError> {
         serde_json::to_vec(value)
             .map(Self)
             .map_err(PayloadError::Json)

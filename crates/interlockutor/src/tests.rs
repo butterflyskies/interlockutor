@@ -107,6 +107,37 @@ fn payload_json_serializes_compact_bytes() {
     .unwrap();
 
     assert_eq!(payload.as_bytes(), br#"{"kind":"ready","count":2}"#);
+
+    let decoded: serde_json::Value = serde_json::from_slice(payload.as_bytes()).unwrap();
+    assert_eq!(decoded, serde_json::json!({"kind": "ready", "count": 2}));
+}
+
+#[test]
+fn payload_json_accepts_unsized_root_values() {
+    assert_eq!(Payload::json("ready").unwrap().as_bytes(), br#""ready""#);
+    assert_eq!(
+        Payload::json(&[1_u8, 2, 3][..]).unwrap().as_bytes(),
+        b"[1,2,3]"
+    );
+}
+
+#[test]
+fn payload_json_preserves_serialization_failure_source() {
+    struct Fails;
+
+    impl serde::Serialize for Fails {
+        fn serialize<S>(&self, _: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            Err(serde::ser::Error::custom("intentional test failure"))
+        }
+    }
+
+    let error = Payload::json(&Fails).unwrap_err();
+    assert!(matches!(error, PayloadError::Json(_)));
+    assert!(std::error::Error::source(&error).is_some());
+    assert!(error.to_string().contains("intentional test failure"));
 }
 
 #[test]
