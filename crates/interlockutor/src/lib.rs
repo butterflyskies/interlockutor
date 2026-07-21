@@ -80,7 +80,6 @@ impl AsRef<[u8]> for Payload {
 
 /// Failure to encode a typed value as an event payload.
 #[derive(Debug)]
-#[non_exhaustive]
 pub enum PayloadError {
     Json(serde_json::Error),
 }
@@ -160,7 +159,6 @@ pub struct WorkAck {
     pub acknowledged_at: Timestamp,
 }
 
-#[non_exhaustive]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Error {
     Unauthorized,
