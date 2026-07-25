@@ -5,6 +5,18 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog], and this project adheres to
 [Semantic Versioning].
 
+## [0.3.0] - 2026-07-24
+
+### Changed
+
+- Removed `#[non_exhaustive]` from `PayloadError` and `Error` per ADR-0040
+  (public enums are exhaustive by default). Both enums now support exhaustive
+  matching without a wildcard arm. Migrating callers who match on
+  `PayloadError` or `Error` with a wildcard arm may drop it in favor of
+  handling each variant explicitly; existing wildcard arms continue to
+  compile unchanged. Adding a new variant to either enum is now a breaking
+  change requiring its own major-version bump.
+
 ## [0.2.0] - 2026-07-12
 
 ### Added
@@ -37,5 +49,6 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 [Keep a Changelog]: https://keepachangelog.com/en/1.1.0/
 [Semantic Versioning]: https://semver.org/spec/v2.0.0.html
+[0.3.0]: https://github.com/butterflyskies/interlockutor/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/butterflyskies/interlockutor/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/butterflyskies/interlockutor/releases/tag/v0.1.0
