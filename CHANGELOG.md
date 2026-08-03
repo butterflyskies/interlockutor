@@ -202,6 +202,13 @@ The format is based on [Keep a Changelog], and this project adheres to
   the public `MemoryStore::with_clock` seam. The store now fail-stops as a typed
   error instead.
 
+  The docs previously said every later operation reports `StorePoisoned`, which
+  is broader than the code. Authorization is checked before the lock is taken,
+  so a denied call still returns `Unauthorized` on a poisoned store. That
+  ordering is deliberate — the policy answer must not depend on the store's
+  health, or a poisoned store becomes an oracle for which operations would have
+  been permitted — and it is now documented and tested in both directions.
+
   Poisoning is permanent and recovery is deliberately not offered, even though
   the reference store's invariants do survive it — every clock sample is taken
   either before any mutation in its critical section or after one that already

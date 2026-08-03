@@ -422,10 +422,17 @@ pub enum Error {
     /// the store. [`MemoryStore::with_clock`] is a public seam, which makes this
     /// a foreseeable input rather than a corruption event.
     ///
-    /// This is permanent and deliberate. Once poisoned the store never recovers;
-    /// every later operation returns this error. See [`MemoryStore`] for why
-    /// this is reported rather than panicked, and why recovery is not offered
-    /// even though the reference store's invariants do in fact survive.
+    /// This is permanent and deliberate. Once poisoned the store never recovers.
+    ///
+    /// It is not, however, what *every* later call returns. Authorization is
+    /// checked before the lock is taken, so a call the [`Authorizer`] denies
+    /// still returns [`Error::Unauthorized`] on a poisoned store. That ordering
+    /// is deliberate and load-bearing: the policy answer must not depend on the
+    /// store's health, or a poisoned store would start disclosing which
+    /// operations *would* have been permitted. Only calls that get past
+    /// authorization report this error. See [`MemoryStore`] for why the
+    /// fail-stop is reported rather than panicked, and why recovery is not
+    /// offered even though the reference store's invariants do in fact survive.
     StorePoisoned,
 }
 
@@ -687,8 +694,18 @@ impl<T: EventStore + ?Sized> EventStoreExt for T {
 /// # A panicking [`Clock`] fail-stops the store, as an error
 ///
 /// This store samples its clock while holding the state lock, so a panic inside
-/// an injected `Clock::now` poisons that lock. Every later operation then
-/// reports [`Error::StorePoisoned`] instead of panicking at the lock.
+/// an injected `Clock::now` poisons that lock. Every later operation that
+/// reaches the lock then reports [`Error::StorePoisoned`] instead of panicking
+/// at it.
+///
+/// **Authorization comes first and stays first.** Each method consults the
+/// [`Authorizer`] before calling [`MemoryStore::lock`], so a denied call returns
+/// [`Error::Unauthorized`] whether or not the store is poisoned. A blanket
+/// "every later operation reports `StorePoisoned`" would be a stronger claim
+/// than the code makes, and the weaker one is the one worth having: a poisoned
+/// store must not become an oracle for which operations the policy would have
+/// allowed. The precedence is asserted by
+/// `authorization_is_decided_before_the_poisoned_fail_stop`.
 ///
 /// Returning an error is chosen over the two alternatives on purpose.
 ///

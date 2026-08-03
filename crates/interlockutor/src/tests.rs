@@ -1023,6 +1023,97 @@ fn the_scan_floor_crosses_a_lapsed_lease_that_spent_the_last_fence() {
     assert_eq!(scan_floor_of(&store, &topic), 2);
 }
 
+/// A poisoned store still answers the policy question first.
+///
+/// "Every later operation reports `StorePoisoned`" was too broad. Every method
+/// consults the [`Authorizer`] before it takes the lock, so a denied call
+/// returns [`Error::Unauthorized`] on a poisoned store exactly as it would on a
+/// healthy one.
+///
+/// The ordering is worth keeping rather than a wart to document around: if
+/// poisoning outranked policy, a poisoned store would answer differently for
+/// permitted and denied operations and so disclose which ones the policy would
+/// have allowed. Both directions are asserted here, on one store, so the test
+/// cannot pass by the authorizer being consulted in neither case.
+///
+/// One panic is expected on stderr while this test runs: it is the injected one.
+#[test]
+fn authorization_is_decided_before_the_poisoned_fail_stop() {
+    struct PanickingClock {
+        armed: AtomicBool,
+    }
+    impl Clock for PanickingClock {
+        fn now(&self) -> Timestamp {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "injected clock panic, under the state lock"
+            );
+            0
+        }
+    }
+
+    let clock = Arc::new(PanickingClock {
+        armed: AtomicBool::new(false),
+    });
+    let auth = Arc::new(ToggleAuthorizer::default());
+    auth.allow();
+    let store = MemoryStore::with_clock(clock.clone(), auth.clone());
+    let topic = Topic("work".into());
+    let consumer = ConsumerId("courier".into());
+    append(&store, "a0", "work");
+    let lease = store
+        .claim(&consumer, &topic, Duration::from_secs(1))
+        .unwrap()
+        .expect("claimable before the clock misbehaves");
+
+    clock.armed.store(true, Ordering::SeqCst);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.append("producer", new("a1", "work"));
+    }));
+    assert!(unwound.is_err(), "the armed clock must poison the lock");
+
+    // Permitted calls reach the lock and report the fail-stop.
+    assert_eq!(
+        store.claim_detailed(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(store.ack_work(&lease), Err(Error::StorePoisoned));
+
+    // Denied calls never reach it, so policy is what they report.
+    auth.deny();
+    assert_eq!(
+        store.append("producer", new("a2", "work")),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.read_broadcast(&consumer, &topic, 10),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.ack_broadcast(&consumer, &topic, 1),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.claim_detailed(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.claim(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(
+        store.renew(&lease, Duration::from_secs(1)),
+        Err(Error::Unauthorized)
+    );
+    assert_eq!(store.ack_work(&lease), Err(Error::Unauthorized));
+    assert_eq!(store.nack_work(&lease), Err(Error::Unauthorized));
+
+    // Re-permitting them brings the fail-stop back: poisoning is still permanent
+    // and the authorizer is not masking it.
+    auth.allow();
+    assert_eq!(store.ack_work(&lease), Err(Error::StorePoisoned));
+}
+
 /// A panic in an injected `Clock::now` fail-stops the store as a typed error.
 ///
 /// The store samples its clock under the state lock, so a panicking clock
@@ -1068,8 +1159,11 @@ fn a_panicking_clock_fail_stops_the_store_as_an_error_not_a_panic() {
         "the armed clock must panic under the lock"
     );
 
-    // Every operation now reports the fail-stop rather than panicking at the
-    // lock, including the ones that never touch the clock at all.
+    // Every operation that reaches the lock now reports the fail-stop rather
+    // than panicking at it, including the ones that never touch the clock at
+    // all. This fixture allows everything, so that is all of them here;
+    // `authorization_is_decided_before_the_poisoned_fail_stop` covers the
+    // denied case, which reports policy instead.
     assert_eq!(
         store.append("producer", new("a2", "work")),
         Err(Error::StorePoisoned)
