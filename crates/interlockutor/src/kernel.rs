@@ -23,14 +23,15 @@ enum Phase<Owner> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct LeaseKernel<Owner> {
-    fence: Fence,
+    /// Highest fence ever issued for this item, retained between leases.
+    last_issued: Fence,
     phase: Phase<Owner>,
 }
 
 impl<Owner> Default for LeaseKernel<Owner> {
     fn default() -> Self {
         Self {
-            fence: Fence(0),
+            last_issued: Fence(0),
             phase: Phase::Available,
         }
     }
@@ -40,7 +41,7 @@ impl<Owner> Default for LeaseKernel<Owner> {
 impl<Owner> LeaseKernel<Owner> {
     pub(super) fn available_after(fence: Fence) -> Self {
         Self {
-            fence,
+            last_issued: fence,
             phase: Phase::Available,
         }
     }
@@ -77,7 +78,7 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
             Phase::Available | Phase::Leased(_) => {}
         }
 
-        let Some(next) = self.fence.0.checked_add(1) else {
+        let Some(next) = self.last_issued.0.checked_add(1) else {
             return Claim::FenceExhausted;
         };
         let lease = LeaseRecord {
@@ -85,7 +86,7 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
             fence: Fence(next),
             expires_at,
         };
-        self.fence = lease.fence;
+        self.last_issued = lease.fence;
         self.phase = Phase::Leased(lease.clone());
         Claim::Granted(lease)
     }
@@ -178,7 +179,7 @@ mod proofs {
 
     fn granted(owner: u8, previous_fence: u64) -> (LeaseKernel<u8>, LeaseRecord<u8>) {
         let mut kernel = LeaseKernel {
-            fence: Fence(previous_fence),
+            last_issued: Fence(previous_fence),
             phase: Phase::Available,
         };
         let Claim::Granted(lease) = kernel.claim(owner, 0, 1) else {
@@ -191,7 +192,7 @@ mod proofs {
     fn claim_is_exclusive_and_fences_never_wrap() {
         let previous_fence = kani::any::<u64>();
         let mut kernel = LeaseKernel {
-            fence: Fence(previous_fence),
+            last_issued: Fence(previous_fence),
             phase: Phase::Available,
         };
         let before = kernel.clone();
@@ -289,6 +290,64 @@ mod proofs {
         let exhausted = kernel.clone();
         assert_eq!(kernel.claim(2, 0, 1), Claim::FenceExhausted);
         assert_eq!(kernel, exhausted);
+    }
+
+    #[kani::proof]
+    fn lease_is_live_before_expiry_and_expired_at_the_exact_boundary() {
+        let expires_at = kani::any::<u64>();
+        kani::assume(expires_at > 0);
+        let mut kernel = LeaseKernel {
+            last_issued: Fence(1),
+            phase: Phase::Leased(LeaseRecord {
+                owner: 1_u8,
+                fence: Fence(1),
+                expires_at,
+            }),
+        };
+
+        assert_eq!(kernel.validate(&1, Fence(1), expires_at - 1), Ok(()));
+        let at_boundary = kernel.clone();
+        assert_eq!(
+            kernel.acknowledge(&1, Fence(1), expires_at),
+            Err(LeaseError::Expired)
+        );
+        assert_eq!(kernel, at_boundary);
+    }
+
+    #[kani::proof]
+    fn expired_lease_is_reclaimed_and_old_token_cannot_mutate_the_replacement() {
+        let expires_at = kani::any::<u64>();
+        kani::assume(expires_at > 0 && expires_at < u64::MAX);
+        let mut kernel = LeaseKernel {
+            last_issued: Fence(1),
+            phase: Phase::Leased(LeaseRecord {
+                owner: 1_u8,
+                fence: Fence(1),
+                expires_at,
+            }),
+        };
+
+        let Claim::Granted(replacement) = kernel.claim(2, expires_at, expires_at + 1) else {
+            unreachable!()
+        };
+        assert_eq!(replacement.fence, Fence(2));
+        let after_reclaim = kernel.clone();
+
+        assert_eq!(
+            kernel.renew(&1, Fence(1), expires_at, expires_at + 1),
+            Err(LeaseError::StaleFence)
+        );
+        assert_eq!(kernel, after_reclaim);
+        assert_eq!(
+            kernel.acknowledge(&1, Fence(1), expires_at),
+            Err(LeaseError::StaleFence)
+        );
+        assert_eq!(kernel, after_reclaim);
+        assert_eq!(
+            kernel.release(&1, Fence(1), expires_at),
+            Err(LeaseError::StaleFence)
+        );
+        assert_eq!(kernel, after_reclaim);
     }
 
     #[kani::proof]

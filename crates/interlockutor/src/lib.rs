@@ -4,11 +4,14 @@
 //! distributed backends implement [`EventStore`] and must pass the same
 //! conformance suite.
 //!
-//! # Migrating from 0.1
+//! # Migrating between minor versions
 //!
-//! Version 0.2 replaces raw `Vec<u8>` event payloads with [`Payload`] and
-//! changes [`MemoryStore::new`] to accept only an authorizer. Tests and custom
-//! backends that inject a clock should use [`MemoryStore::with_clock`].
+//! - 0.1 to 0.2: wrap raw event bytes in [`Payload`]. [`MemoryStore::new`]
+//!   accepts only an authorizer; tests and custom backends that inject a clock
+//!   should use [`MemoryStore::with_clock`].
+//! - 0.2 to 0.3: [`PayloadError`] and [`Error`] are exhaustive. Callers whose
+//!   match already names every variant should remove an unreachable wildcard
+//!   arm; intentionally partial matches need no change.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -141,7 +144,10 @@ pub struct BroadcastAck {
     pub acknowledged_at: Timestamp,
 }
 
-/// A fencing token. A higher value supersedes every lower value for the item.
+/// A monotonically issued fencing token for one item.
+///
+/// Lease mutations require exact equality with the item's active fence. Both
+/// stale lower values and unissued higher values are rejected.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct Fence(pub u64);
 
@@ -178,7 +184,24 @@ pub enum Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Unauthorized => f.write_str("operation is not authorized"),
+            Self::DuplicateEventId => f.write_str("event ID is already in use"),
+            Self::IdempotencyKeyConflict { key } => {
+                write!(f, "idempotency key conflicts with an existing event: {}", key.0)
+            }
+            Self::OutOfOrderAck { expected, actual } => write!(
+                f,
+                "broadcast acknowledgement is out of order: expected {expected}, got {actual}"
+            ),
+            Self::UnknownEvent => f.write_str("event is unknown"),
+            Self::NotLeaseOwner => f.write_str("caller does not own the active lease"),
+            Self::StaleFence => f.write_str("fencing token does not match the active lease"),
+            Self::LeaseExpired => f.write_str("lease has expired"),
+            Self::InvalidLeaseDuration => f.write_str(
+                "lease duration must be at least one millisecond and produce a representable expiration",
+            ),
+        }
     }
 }
 
@@ -266,10 +289,11 @@ pub trait EventStore: Send + Sync {
 
     /// Claims the first available event.
     ///
-    /// A positive duration whose expiration cannot be represented is rejected
-    /// as [`Error::InvalidLeaseDuration`]. If an item's `u64` fencing-token
-    /// space is exhausted, that item remains permanently unavailable and the
-    /// search continues with later events.
+    /// Durations are measured in whole milliseconds. Durations below one
+    /// millisecond, durations outside the timestamp domain, and unrepresentable
+    /// expiration times are rejected as [`Error::InvalidLeaseDuration`]. If an
+    /// item's `u64` fencing-token space is exhausted, that item remains
+    /// permanently unavailable and the search continues with later events.
     fn claim(
         &self,
         consumer: &ConsumerId,
@@ -278,13 +302,18 @@ pub trait EventStore: Send + Sync {
     ) -> Result<Option<Lease>, Error>;
 
     /// Renews a current lease without changing its owner or fence.
+    ///
+    /// Duration validation is identical to [`EventStore::claim`].
     fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error>;
 
     /// Makes work terminal in this store; it does not transact external effects.
     ///
     /// A successful acknowledgement is not itself retry-idempotent: calling
     /// this method again with the consumed lease returns [`Error::NotLeaseOwner`].
-    /// Callers that need a durable receipt must retain the returned [`WorkAck`].
+    /// The returned [`WorkAck`] is a freely constructible acknowledgement
+    /// record, not an authenticated or durable receipt. Callers that need
+    /// replay-stable acceptance must provide that guarantee at the recipient
+    /// boundary before acknowledging the queue item.
     fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error>;
 
     /// Releases work immediately. The next claim receives a higher fence
@@ -508,7 +537,7 @@ impl EventStore for MemoryStore {
         let renewed = state
             .work
             .get_mut(&lease.event.id)
-            .ok_or(Error::UnknownEvent)?
+            .expect("validated lease state exists")
             .renew(&lease.owner, lease.fence, now, expires_at)
             .map_err(map_lease_error)?;
         Ok(Lease {
@@ -532,9 +561,9 @@ impl EventStore for MemoryStore {
         state
             .work
             .get_mut(&lease.event.id)
-            .expect("validated")
+            .expect("validated lease state exists")
             .acknowledge(&lease.owner, lease.fence, now)
-            .expect("validated");
+            .expect("validated lease remains valid");
         Ok(WorkAck {
             event_id: lease.event.id.clone(),
             owner: lease.owner.clone(),
@@ -556,7 +585,7 @@ impl EventStore for MemoryStore {
         state
             .work
             .get_mut(&lease.event.id)
-            .ok_or(Error::UnknownEvent)?
+            .expect("validated lease state exists")
             .release(&lease.owner, lease.fence, now)
             .map_err(map_lease_error)?;
         Ok(())

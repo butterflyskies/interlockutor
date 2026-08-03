@@ -389,6 +389,14 @@ fn zero_duration_is_rejected() {
 }
 
 #[test]
+fn lease_duration_error_explains_granularity_and_range() {
+    assert_eq!(
+        Error::InvalidLeaseDuration.to_string(),
+        "lease duration must be at least one millisecond and produce a representable expiration"
+    );
+}
+
+#[test]
 fn timestamp_overflow_is_rejected_without_creating_a_lease() {
     let (store, clock) = fixture();
     append(&store, "job", "work");
@@ -402,6 +410,17 @@ fn timestamp_overflow_is_rejected_without_creating_a_lease() {
         ),
         Err(Error::InvalidLeaseDuration)
     );
+
+    clock.set(0);
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(lease.fence, Fence(1));
 }
 
 #[test]
