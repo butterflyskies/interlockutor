@@ -314,6 +314,14 @@ The format is based on [Keep a Changelog], and this project adheres to
   decides who records, so the racing path is unchanged and shares one validation
   routine with the fast path.
 
+  The test covering this was named `..._does_not_stage_or_fsync`, which its body
+  did not prove and which was false: the fast path shares `validate_existing`
+  with the racing path and so deliberately fsyncs the `effects/` directory
+  before calling anything a prior acceptance. It is renamed to
+  `redelivery_of_an_accepted_event_does_no_staging_file_work`, which is what it
+  measures, and it now arms a directory-sync fault as well — pinning the fsync
+  the old name denied rather than leaving it to prose.
+
 ## [0.3.0] - 2026-07-24
 
 ### Changed

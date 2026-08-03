@@ -2098,19 +2098,31 @@ fn a_cleanup_failure_never_masks_the_primary_failure() -> Result<(), Box<dyn Std
     Ok(())
 }
 
-/// Redelivery of an accepted event writes nothing at all.
+/// Redelivery of an accepted event does no staging-file work.
 ///
 /// At-least-once delivery makes redelivery the common case, and it used to cost
-/// a staging create, a full record write, an `fsync`, a failed link and an
+/// a staging create, a full record write, a file `fsync`, a failed link and an
 /// unlink — every time — to discover a record that was already on disk. The
 /// existence check now comes first.
 ///
-/// Measured by fault injection rather than by timing: staging removals are armed
-/// to fail, so *if* the fast path staged anything the attempt would report an
-/// error. It returns `Existing`, so it did not stage.
+/// This was called `..._does_not_stage_or_fsync`, which its body did not prove
+/// and which is false besides: the fast path goes through `validate_existing`,
+/// which **deliberately** fsyncs the `effects/` directory before calling
+/// anything a prior acceptance, so that a courier cannot acknowledge over an
+/// entry a previous attempt left visible but never made durable. Dropping that
+/// fsync is the defect `post_link_directory_sync_failure_is_repaired_before_
+/// existing_is_returned` exists to catch. The name now says staging-file work,
+/// which is what the body measures.
+///
+/// Measured by fault injection rather than by timing, in both directions:
+///
+/// - staging removals are armed to fail, so *if* the fast path staged anything
+///   the attempt would report an error. It returns `Existing`, so it did not.
+/// - a directory sync is armed to fail, and the fast path *does* report it —
+///   which pins the fsync the old name denied instead of leaving it to prose.
 #[cfg(unix)]
 #[test]
-fn redelivery_of_an_accepted_event_does_not_stage_or_fsync() -> Result<(), Box<dyn StdError>> {
+fn redelivery_of_an_accepted_event_does_no_staging_file_work() -> Result<(), Box<dyn StdError>> {
     let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
     let appended = match store.append("dispatcher", urgent_message())? {
         AppendOutcome::Appended(event) => event,
@@ -2133,6 +2145,22 @@ fn redelivery_of_an_accepted_event_does_not_stage_or_fsync() -> Result<(), Box<d
     }
     assert_eq!(recipient.staging_entries()?, 0, "nothing was staged");
     assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
+
+    // The other direction, so the name cannot quietly widen back out: the fast
+    // path still takes the `effects/` durability barrier. Arming one directory
+    // sync to fail makes a redelivery report it, which would be impossible if
+    // the fast path skipped the fsync.
+    recipient.fail_next_dir_syncs(1);
+    let error = recipient
+        .accept(&appended)
+        .err()
+        .ok_or("the redelivery fast path must still fsync effects/")?;
+    assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
+    assert!(
+        error.to_string().contains("directory sync"),
+        "the reported failure must be the directory sync: {error}"
+    );
+    assert_eq!(recipient.staging_entries()?, 0, "still nothing was staged");
 
     // The racing path is unchanged: a first-time event still runs the full
     // five-step commit, and would trip the armed cleanup fault if it ran.
