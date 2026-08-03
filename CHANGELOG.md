@@ -242,7 +242,25 @@ The format is based on [Keep a Changelog], and this project adheres to
   removals, relocations, and untouched-undated entries apart instead of summing
   them.
 
-- Quarantine publication can no longer overwrite the entry it is preserving.
+- **Narrowed:** `quarantine/` is documented as visibility only. It takes no
+  directory fsync, so unlike `effects/` it is **not crash-durable**: a crash can
+  lose the new link or leave the entry reachable under both names. The atomic
+  visibility that `hard_link` provides is not durability, and the previous
+  wording did not keep those apart.
+
+- **Narrowed:** `quarantine/` has **no recovery or disposition API** in v1.
+  Nothing reads it back, re-links an entry into `effects/`, prunes it, or bounds
+  its size. It is indefinite operator-owned debris — somewhere other than
+  `/dev/null` for an exclusive pass to put an entry — and the earlier
+  "preserved for an operator or an exclusive recovery pass" wording promised a
+  lifecycle that does not exist.
+
+  Stated as a negative, because silence reads as permission: **nothing
+  downstream may treat `quarantine/` as evidence custody** until a recovery
+  lifecycle exists. Effect preservation, audit, and replay must not be built on
+  it, and nothing may be acknowledged on the strength of a file appearing there.
+
+- Quarantine publication can no longer overwrite an entry already there.
   The target name was chosen with `while target.exists()` and then taken with
   `fs::rename`. The check is stale before the act; the collision tiebreak was a
   process-local counter, so two processes resolving the same collision resolve
@@ -259,7 +277,9 @@ The format is based on [Keep a Changelog], and this project adheres to
   overwriting, and the retry budget is bounded and reported if exhausted. Two
   tests cover it: a deterministic forced collision where every entry shares one
   file name, and a concurrent one where every thread races for the same first
-  name. Both assert that every distinct byte string is still readable.
+  name. Both assert that every distinct byte string is still readable. That is
+  a property of the publication step, not a custody claim about the directory —
+  see the narrowing entries above.
 
 - The scavenger reports a failed reap instead of dropping it. Deletion was
   `if fs::remove_file(..).is_ok()`, which turned a permission or I/O failure

@@ -39,7 +39,7 @@
 //! | 6. remove staging | the record is committed but debris remains in `tmp/` | the record is already in `effects/`, so redelivery reports `Existing` | attempt reports `Err` over a durable record; conservative, never duplicated | `a_failed_staging_cleanup_is_reported_rather_than_swallowed`, `a_cleanup_failure_never_masks_the_primary_failure` |
 //! | scavenge, known age | a **live** staging name can be removed when an attempt outlives `stale_after` | that attempt's `hard_link` fails with `NotFound` | attempt fails loudly; `effects/` is never wrong and never duplicated | `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` |
 //! | scavenge, unknown age, concurrent | unchanged: the entry is left exactly where it is and counted | nothing: the owner's staging name is still its own | correct — an independently-owned attempt commits normally | `concurrent_scavenging_leaves_an_undated_stage_for_its_owner` |
-//! | scavenge, unknown age, exclusive | the entry is moved to `quarantine/`, never deleted | staging name is gone | the caller asserted no attempt was in flight, so there is nothing to break | `future_dated_staging_files_are_quarantined_rather_than_reaped` |
+//! | scavenge, unknown age, exclusive | the entry is moved to `quarantine/`, never deleted, never overwritten | staging name is gone | the caller asserted no attempt was in flight, so there is nothing to break; the move is visibility only and not crash-durable | `future_dated_staging_files_are_quarantined_rather_than_reaped`, `quarantine_publication_never_overwrites_an_existing_entry` |
 //! | `Existing` validation | — | a record at the right path is only acceptance if it equals the expected receipt in full | mismatch is `UnusableRecord`, never `Existing`, never repaired in place | `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
 //!
 //! ## Untested cells, stated rather than smoothed over
@@ -52,6 +52,10 @@
 //! - **Crash durability is not demonstrated.** No in-process test can pull
 //!   power. The fsync steps are implemented to the standard commit protocol and
 //!   argued; nothing here proves them.
+//! - **`quarantine/` is not crash-durable at all**, argued or otherwise. It
+//!   takes no directory fsync, and it has no recovery or disposition API in v1.
+//!   See [`EffectStore::quarantine_dir`], which states that as a negative:
+//!   nothing downstream may treat it as evidence custody.
 //! - **The scavenger's reap window is a heuristic, not a proof of abandonment.**
 //!   See [`EffectStore::scavenge`].
 //!
@@ -84,6 +88,12 @@
 //! not by the entry. A store opened for concurrent use leaves it untouched and
 //! reports it. Only [`EffectStore::open_exclusive`], where the caller asserts
 //! that no other attempt is in flight, may move it out of the staging namespace.
+//!
+//! Where it moves it to promises very little, deliberately. `quarantine/` is
+//! visibility only: no directory fsync, so it is not crash-durable, and no
+//! recovery or disposition API in v1, so it is indefinite operator-owned
+//! debris. It is **not** evidence custody and nothing downstream may treat it
+//! as such. [`EffectStore::quarantine_dir`] states the boundary in full.
 
 use interlockutor::{
     AllowAll, AppendOutcome, ClaimOutcome, Clock, ConsumerId, Error, Event, EventId, EventStore,
@@ -294,7 +304,7 @@ struct Faults {
 /// the action as well as the classification. Moving an entry out of the staging
 /// namespace takes the name away from whoever owns it just as surely as deleting
 /// it does: the owner's `hard_link` then fails with `NotFound`. So the
-/// distinction is not "delete versus preserve", it is **who is allowed to touch
+/// distinction is not "delete versus keep", it is **who is allowed to touch
 /// live work at all**.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum UndatedPolicy {
@@ -308,6 +318,10 @@ enum UndatedPolicy {
     /// Licensed only by the caller's assertion in [`EffectStore::open_exclusive`]
     /// that no other attempt is in flight, which is what makes "this is debris"
     /// a fact supplied from outside rather than an inference from age.
+    ///
+    /// Moving it there is not a promise to keep it. See
+    /// [`EffectStore::quarantine_dir`]: the destination is visibility only,
+    /// not crash-durable, and has no recovery lifecycle.
     Quarantine,
 }
 
@@ -376,7 +390,10 @@ impl EffectStore {
     ///
     /// The same assertion is what licenses moving an *undated* entry to
     /// `quarantine/`. Absent it, an undated entry may be somebody's live stage
-    /// and taking its name away breaks that attempt exactly as deleting it would.
+    /// and taking its name away breaks that attempt exactly as deleting it
+    /// would. Note what the move is and is not: see
+    /// [`EffectStore::quarantine_dir`], which is visibility only and carries no
+    /// custody or recovery guarantee.
     fn open_exclusive(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
         Self::open_unchecked(root, stale_after, UndatedPolicy::Quarantine)
     }
@@ -502,8 +519,40 @@ impl EffectStore {
         self.root.join("duplicates")
     }
 
-    /// Holds staging entries whose age could not be established. Never read as
-    /// an effect, never reaped by age — see [`EffectStore::scavenge`].
+    /// Holds staging entries relocated by an exclusive recovery pass.
+    ///
+    /// # Visibility only: not crash-durable, and not custody
+    ///
+    /// Two promises are deliberately **not** made about this directory, and
+    /// earlier wording here implied both.
+    ///
+    /// **It is not crash-durable.** Publication is a `hard_link` followed by an
+    /// unlink of the original name, and neither this directory nor `tmp/` is
+    /// fsynced afterwards. The entry is atomically *visible* — that comes from
+    /// `hard_link` itself, and it is what makes the no-clobber property in
+    /// [`EffectStore::quarantine`] real — but a crash can lose the new link, or
+    /// leave the entry reachable under both names. `effects/` takes a directory
+    /// fsync precisely because a committed record has to survive power loss.
+    /// This directory takes none, and nothing here demonstrates otherwise.
+    ///
+    /// **There is no recovery or disposition API.** Nothing reads this
+    /// directory back, nothing re-links an entry into `effects/`, nothing
+    /// prunes it, and nothing bounds its size. It is indefinite, operator-owned
+    /// debris. It exists so an exclusive pass has somewhere to put an entry
+    /// other than `/dev/null`, and in v1 that is the whole of the contract.
+    ///
+    /// **Stated as a negative, because silence reads as permission:** nothing
+    /// downstream may treat `quarantine/` as evidence custody. Do not build
+    /// effect preservation, audit, or replay on it, and do not acknowledge
+    /// anything on the strength of a file appearing here. A best-effort store
+    /// with no durability barrier and no recovery lifecycle cannot carry those
+    /// guarantees, and will not be able to until such a lifecycle exists. If
+    /// one is ever added, this paragraph is what has to change first.
+    ///
+    /// What it does promise is narrow, and is tested: an entry published here
+    /// never replaces one already here ([`EffectStore::quarantine`]), it is
+    /// never read as an effect, and it is never reaped by age
+    /// ([`EffectStore::scavenge`]).
     fn quarantine_dir(&self) -> PathBuf {
         self.root.join("quarantine")
     }
@@ -616,9 +665,17 @@ impl EffectStore {
     ///
     /// # No-clobber is the point of this directory, not a nicety
     ///
-    /// The whole purpose of `quarantine/` is to be the thing that survives.
-    /// A publication that can replace an existing entry is not a storage bug in
-    /// this directory — it is the feature negating its own reason to exist.
+    /// Against a scavenging pass, this directory's whole job is to be the thing
+    /// that is not thrown away. A publication that can replace an entry already
+    /// here is therefore not a storage bug — it is the feature negating its own
+    /// reason to exist.
+    ///
+    /// That is a claim about *this operation* and nothing wider. See
+    /// [`EffectStore::quarantine_dir`] for what the directory does not promise:
+    /// it is not crash-durable and it is not custody. Those are narrower
+    /// guarantees than no-clobber, not a licence to relax it — a store that may
+    /// lose an entry to power loss has all the more reason not to lose one to
+    /// its own scavenger.
     ///
     /// The previous implementation chose a name with `while target.exists()` and
     /// then took it with `fs::rename`. Both halves are wrong for that purpose:
@@ -1734,14 +1791,16 @@ fn future_dated_staging_files_are_quarantined_rather_than_reaped() -> Result<(),
     assert_eq!(
         recipient.quarantine_entries()?,
         1,
-        "the entry is preserved for exclusive recovery"
+        "the entry left the staging namespace without being deleted"
     );
 
-    // The bytes survived: quarantine preserves evidence, it does not destroy it.
-    let preserved = fs::read_dir(recipient.quarantine_dir())?
+    // The bytes are still readable. That is a statement about this pass, not a
+    // custody claim: `quarantine/` is visibility only, takes no directory
+    // fsync, and has no recovery API. See `EffectStore::quarantine_dir`.
+    let relocated = fs::read_dir(recipient.quarantine_dir())?
         .next()
         .ok_or("quarantine should hold the entry")??;
-    assert_eq!(recipient.read_record(&preserved.path())?, receipt);
+    assert_eq!(recipient.read_record(&relocated.path())?, receipt);
 
     // Repeated passes do not re-quarantine or lose anything.
     assert_eq!(
@@ -1776,7 +1835,7 @@ fn colliding_sources(root: &Path, count: usize) -> io::Result<Vec<(PathBuf, Vec<
             let dir = root.join(format!("attempt-{index}"));
             fs::create_dir_all(&dir)?;
             let path = dir.join("s1234-0");
-            let body = format!("evidence-{index}").into_bytes();
+            let body = format!("body-{index}").into_bytes();
             fs::write(&path, &body)?;
             Ok((path, body))
         })
@@ -1797,7 +1856,7 @@ fn colliding_sources(root: &Path, count: usize) -> io::Result<Vec<(PathBuf, Vec<
 /// that the names differ but that every distinct byte string is still readable.
 #[cfg(unix)]
 #[test]
-fn quarantine_publication_never_overwrites_existing_evidence() -> Result<(), Box<dyn StdError>> {
+fn quarantine_publication_never_overwrites_an_existing_entry() -> Result<(), Box<dyn StdError>> {
     const ENTRIES: usize = 4;
 
     let scratch = ScratchRoot::create()?;

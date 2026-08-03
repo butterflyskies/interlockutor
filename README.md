@@ -217,9 +217,45 @@ window; `open_exclusive` is the named escape hatch for recovery-time reaping,
 where the caller supplies exclusivity instead of the heuristic inferring it.
 Both directions are tested against a genuinely live stage, not simulated debris.
 
+Unknown age is treated as no evidence in **both** directions. An entry whose
+mtime is unreadable or dated in the future is never reaped — and, under a store
+opened for concurrent use, never moved either. Relocating an entry takes its
+staging name away from whoever owns it exactly as deleting it does, so the
+owner's `hard_link` fails with `NotFound` all the same; a correct classification
+paired with that action still broke a live commit. Only `open_exclusive`, where
+the caller asserts that no other attempt is in flight, may move an undated entry
+to `quarantine/`. A concurrent store leaves it in place and counts it.
+
 Making this exact needs real ownership evidence — an advisory lock, a liveness
 marker, or linking from an open descriptor so the pathname stops mattering.
 That is deliberately out of scope here.
+
+### `quarantine/` is visibility only, and is not evidence custody
+
+Two things this directory does not promise, stated plainly because earlier
+wording implied both:
+
+- **It is not crash-durable.** Publication is a `hard_link` followed by an
+  unlink of the original name, and neither `quarantine/` nor `tmp/` is fsynced
+  afterwards. The entry is atomically *visible*, which is what makes the
+  no-clobber property real, but a crash can lose the new link or leave the entry
+  reachable under both names. `effects/` takes a directory fsync because a
+  committed record must survive power loss. This directory takes none.
+- **There is no recovery or disposition API in v1.** Nothing reads it back,
+  nothing re-links an entry into `effects/`, nothing prunes it, and nothing
+  bounds its size. It is indefinite, operator-owned debris — somewhere other
+  than `/dev/null` for an exclusive pass to put an entry.
+
+**The negative, because silence reads as permission:** nothing downstream may
+treat `quarantine/` as evidence custody. Do not build effect preservation,
+audit, or replay on it, and do not acknowledge anything because a file appeared
+there. A best-effort store with no durability barrier and no recovery lifecycle
+cannot carry those guarantees.
+
+What it does promise is narrow and tested: an entry published there never
+replaces one already there — publication is a no-clobber `hard_link`, not a
+check-then-`rename` that could silently replace the destination — it is never
+read as an effect, and it is never reaped by age.
 
 ### Durability boundary
 
