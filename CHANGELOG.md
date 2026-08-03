@@ -224,9 +224,32 @@ The format is based on [Keep a Changelog], and this project adheres to
   immediately at any window, bypassing the `MIN_CONCURRENT_STALE_AFTER` floor
   that `open_with` exists to enforce — despite a future-dated mtime being a
   clock step or nonmonotonic filesystem, and at least as likely to be live work
-  as debris. Only known ages meeting the threshold are removed; entries with no
-  establishable age are moved to a `quarantine/` directory, intact, for an
-  operator or an exclusive recovery pass.
+  as debris. Only known ages meeting the threshold are removed.
+
+- The scavenger no longer *moves* an undated staging entry out from under a
+  concurrent owner either. Correcting the classification left the action
+  unchanged: having concluded that an unknown age is no evidence of abandonment,
+  it renamed the entry into `quarantine/` anyway — and a rename takes the
+  staging name from its owner exactly as a delete does, so the live attempt's
+  `hard_link` failed with `NotFound` all the same. Right belief, wrong act, and
+  under `open_with` it broke an independently-owned in-flight commit on no
+  evidence at all.
+
+  What may be done with an undated entry is now fixed at open time and decided
+  by exclusivity rather than by the entry. `open_with` leaves it untouched and
+  counts it; only `open_exclusive`, where the caller asserts that no other
+  attempt is in flight, may relocate it. `scavenge` returns a report that keeps
+  removals, relocations, and untouched-undated entries apart instead of summing
+  them.
+
+- The scavenger reports a failed reap instead of dropping it. Deletion was
+  `if fs::remove_file(..).is_ok()`, which turned a permission or I/O failure
+  into "there was nothing to remove" and left debris that nothing had reported.
+  Every unlink in the adapter now goes through one helper whose postcondition is
+  *the name is gone* — so `NotFound` is success, since a concurrent reaper may
+  take a name at any moment — and no call site discards the outcome silently.
+  The one subordinated cleanup, on the staging-write error path, says so and
+  names the rule it is subordinate to rather than being an anonymous discard.
 
 - Staging-file removal failures are reported instead of discarded. The module
   docs promise the staging file is removed on every outcome, and

@@ -38,7 +38,8 @@
 //! | 5. `sync_all` `effects/` | **entry is visible but may not be crash-durable**, and `commit` returns `Err` | `AlreadyExists`; the retry re-fsyncs `effects/` *before* validating, and propagates a repeated failure | correct — previously a courier could ACK a non-durable entry | `post_link_directory_sync_failure_is_repaired_before_existing_is_returned` |
 //! | 6. remove staging | the record is committed but debris remains in `tmp/` | the record is already in `effects/`, so redelivery reports `Existing` | attempt reports `Err` over a durable record; conservative, never duplicated | `a_failed_staging_cleanup_is_reported_rather_than_swallowed`, `a_cleanup_failure_never_masks_the_primary_failure` |
 //! | scavenge, known age | a **live** staging name can be removed when an attempt outlives `stale_after` | that attempt's `hard_link` fails with `NotFound` | attempt fails loudly; `effects/` is never wrong and never duplicated | `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` |
-//! | scavenge, unknown age | the entry is moved to `quarantine/`, never deleted | staging name is gone, so a live attempt's `hard_link` fails with `NotFound` | attempt fails loudly; the bytes are preserved for recovery | `future_dated_staging_files_are_quarantined_rather_than_reaped` |
+//! | scavenge, unknown age, concurrent | unchanged: the entry is left exactly where it is and counted | nothing: the owner's staging name is still its own | correct — an independently-owned attempt commits normally | `concurrent_scavenging_leaves_an_undated_stage_for_its_owner` |
+//! | scavenge, unknown age, exclusive | the entry is moved to `quarantine/`, never deleted | staging name is gone | the caller asserted no attempt was in flight, so there is nothing to break | `future_dated_staging_files_are_quarantined_rather_than_reaped` |
 //! | `Existing` validation | — | a record at the right path is only acceptance if it equals the expected receipt in full | mismatch is `UnusableRecord`, never `Existing`, never repaired in place | `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
 //!
 //! ## Untested cells, stated rather than smoothed over
@@ -69,9 +70,20 @@
 //! window, bypassing the `MIN_CONCURRENT_STALE_AFTER` floor entirely. No
 //! evidence of age is not evidence of abandonment — a future-dated file is a
 //! clock step or a nonmonotonic filesystem, and is at least as likely to be live
-//! work. Only known ages meeting the threshold are reaped now. Entries with no
-//! establishable age are moved to `quarantine/`, out of the staging namespace
-//! but intact, for an operator or an exclusive recovery pass.
+//! work. Only known ages meeting the threshold are reaped.
+//!
+//! Correcting that belief left a second defect behind it, because the belief and
+//! the action had come apart. Having concluded "no evidence of abandonment", the
+//! scavenger still *renamed* the entry into `quarantine/` — and a rename takes
+//! the staging name away from its owner exactly as a delete does, so the live
+//! attempt's `hard_link` failed with `NotFound` all the same. Right belief,
+//! wrong act, and under a concurrently-opened store it broke an independently
+//! owned in-flight commit on no evidence at all.
+//!
+//! What may be done with an undated entry is therefore decided by exclusivity,
+//! not by the entry. A store opened for concurrent use leaves it untouched and
+//! reports it. Only [`EffectStore::open_exclusive`], where the caller asserts
+//! that no other attempt is in flight, may move it out of the staging namespace.
 
 use interlockutor::{
     AllowAll, AppendOutcome, ClaimOutcome, Clock, ConsumerId, Error, Event, EventId, EventStore,
@@ -269,6 +281,44 @@ struct Faults {
     staging_removals_to_fail: AtomicU64,
 }
 
+/// What the scavenger may do with an entry whose age it cannot establish.
+///
+/// Unknown age is *no evidence of abandonment*, and that belief has to govern
+/// the action as well as the classification. Moving an entry out of the staging
+/// namespace takes the name away from whoever owns it just as surely as deleting
+/// it does: the owner's `hard_link` then fails with `NotFound`. So the
+/// distinction is not "delete versus preserve", it is **who is allowed to touch
+/// live work at all**.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UndatedPolicy {
+    /// Concurrent use: leave the entry exactly where it is and count it.
+    ///
+    /// Another attempt may own it right now, and there is no evidence either
+    /// way. Reporting is the only action the evidence supports.
+    Report,
+    /// Exclusive recovery: move the entry to `quarantine/`.
+    ///
+    /// Licensed only by the caller's assertion in [`EffectStore::open_exclusive`]
+    /// that no other attempt is in flight, which is what makes "this is debris"
+    /// a fact supplied from outside rather than an inference from age.
+    Quarantine,
+}
+
+/// What one scavenging pass did, split by the evidence it had.
+///
+/// The counts are kept apart because they answer different questions. `removed`
+/// is the only one age licenses on its own; `undated_left_in_place` is the
+/// operator-visible signal that entries exist which nothing here can classify.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ScavengeReport {
+    /// Entries whose age was known and at least `stale_after`.
+    removed: usize,
+    /// Undated entries moved to `quarantine/`, under [`UndatedPolicy::Quarantine`].
+    quarantined: usize,
+    /// Undated entries left untouched, under [`UndatedPolicy::Report`].
+    undated_left_in_place: usize,
+}
+
 /// Test recipient whose effect records outlive any one courier attempt.
 ///
 /// Reconstructing this adapter from the same root models a fresh courier
@@ -276,6 +326,7 @@ struct Faults {
 /// [`MemoryStore`] durable.
 struct EffectStore {
     root: PathBuf,
+    undated: UndatedPolicy,
     faults: Faults,
 }
 
@@ -295,6 +346,9 @@ impl EffectStore {
     ///
     /// Refuses a reap window below [`MIN_CONCURRENT_STALE_AFTER`]: see
     /// [`EffectStore::scavenge`] for why a short window is not a safe knob.
+    ///
+    /// Undated entries are reported, never moved. This store has no exclusivity
+    /// to trade on, so it has no licence to touch an entry it cannot classify.
     fn open_with(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
         if stale_after < MIN_CONCURRENT_STALE_AFTER {
             return Err(AcceptError::ScavengeWindowTooShort {
@@ -302,7 +356,7 @@ impl EffectStore {
                 minimum: MIN_CONCURRENT_STALE_AFTER,
             });
         }
-        Self::open_unchecked(root, stale_after)
+        Self::open_unchecked(root, stale_after, UndatedPolicy::Report)
     }
 
     /// Opens a store for recovery, with **no** floor on the reap window.
@@ -312,13 +366,22 @@ impl EffectStore {
     /// heuristic with an actual exclusivity guarantee supplied from outside.
     /// Nothing in this adapter checks it, so it is a named, deliberate handoff
     /// rather than a silent assumption.
+    ///
+    /// The same assertion is what licenses moving an *undated* entry to
+    /// `quarantine/`. Absent it, an undated entry may be somebody's live stage
+    /// and taking its name away breaks that attempt exactly as deleting it would.
     fn open_exclusive(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
-        Self::open_unchecked(root, stale_after)
+        Self::open_unchecked(root, stale_after, UndatedPolicy::Quarantine)
     }
 
-    fn open_unchecked(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
+    fn open_unchecked(
+        root: &Path,
+        stale_after: Duration,
+        undated: UndatedPolicy,
+    ) -> Result<Self, AcceptError> {
         let store = Self {
             root: root.to_path_buf(),
+            undated,
             faults: Faults::default(),
         };
         fs::create_dir_all(store.effects_dir())?;
@@ -342,7 +405,26 @@ impl EffectStore {
             .store(n, Ordering::SeqCst);
     }
 
-    /// Removes a staging file, reporting failure instead of discarding it.
+    /// Unlinks a name, treating `NotFound` as the postcondition already met.
+    ///
+    /// The postcondition is **the name is gone**, not *this caller removed it*.
+    /// A concurrent scavenger is entitled to reap a staging name at any moment,
+    /// so treating "someone else already removed it" as a failure would report
+    /// an error for an operation that fully succeeded. Every unlink in this
+    /// adapter goes through here, so that rule has one definition rather than
+    /// one per call site — and no call site gets to quietly discard the outcome.
+    ///
+    /// `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` exercises
+    /// the `NotFound` case on its concurrent path.
+    fn remove_name(path: &Path) -> io::Result<()> {
+        match fs::remove_file(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
+    }
+
+    /// Removes an attempt's own staging file, reporting failure instead of
+    /// discarding it.
     ///
     /// This was `let _ = fs::remove_file(staging);` on every path. The module
     /// docs promise the staging file is "always removed, on every outcome, so
@@ -351,13 +433,10 @@ impl EffectStore {
     /// that looks identical to a crashed attempt with nothing having reported a
     /// problem.
     ///
-    /// The postcondition is **the staging name is gone**, not *this attempt
-    /// removed it*. `NotFound` therefore satisfies it: a concurrent scavenger is
-    /// entitled to reap the name at any moment, so treating "someone else
-    /// already removed it" as a cleanup failure would report an error for a
-    /// commit that fully succeeded. That distinction is what
-    /// `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` exercises
-    /// on its concurrent path.
+    /// Fault injection is deliberately confined to this entry point rather than
+    /// to [`EffectStore::remove_name`]: the injected faults model an attempt's
+    /// cleanup failing, and arming them must not also break the scavenger that
+    /// every `open` runs.
     fn remove_staging(&self, staging: &Path) -> io::Result<()> {
         if self
             .faults
@@ -369,10 +448,7 @@ impl EffectStore {
         {
             return Err(io::Error::other("injected staging removal failure"));
         }
-        match fs::remove_file(staging) {
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-            other => other,
-        }
+        Self::remove_name(staging)
     }
 
     /// Flushes a directory's entries to stable storage.
@@ -458,29 +534,40 @@ impl EffectStore {
     /// Making this exact rather than heuristic needs real ownership evidence —
     /// an advisory lock, a liveness marker, or linking from an open descriptor
     /// so the pathname stops mattering. That is deliberately not done here.
-    /// # Unknown and future-dated mtimes are quarantined, never reaped
+    /// # Unknown and future-dated mtimes are never reaped, and only moved under
+    /// exclusivity
     ///
     /// Age is the only evidence, so an entry whose age cannot be *established*
-    /// carries no evidence at all. This previously treated those entries as
-    /// stale and deleted them immediately — the exact opposite of what the
-    /// evidence supports, and a bypass of the `stale_after` floor that
+    /// carries no evidence at all. This once treated those entries as stale and
+    /// deleted them immediately — the exact opposite of what the evidence
+    /// supports, and a bypass of the `stale_after` floor that
     /// [`EffectStore::open_with`] exists to enforce. A file with an unreadable
     /// mtime, or one dated in the future because of a clock step or a
     /// nonmonotonic filesystem, is *more* likely to be live work than debris,
     /// and a concurrently-opened store would delete it at age zero.
     ///
-    /// Such entries are now moved to `quarantine/` instead: out of the staging
-    /// namespace so they cannot be confused with an in-flight attempt or
-    /// re-reaped on every open, but preserved for an operator or an exclusive
-    /// recovery pass to inspect. Quarantining a *live* stage has the same
-    /// conservative failure as reaping one — that attempt's `hard_link` fails
-    /// with `NotFound` and records nothing — but it destroys no evidence.
+    /// Correcting the belief was not enough, because the *action* still moved
+    /// the entry: a rename into `quarantine/` takes the staging name away from
+    /// whoever owns it, and the owner's later `hard_link` fails with `NotFound`
+    /// exactly as it would after a delete. Concluding "no evidence of
+    /// abandonment" and then relocating the file anyway is the right belief
+    /// paired with the wrong act, and under [`EffectStore::open_with`] it broke
+    /// an independently-owned in-flight attempt with no evidence at all.
     ///
-    /// Only entries whose age is known **and** at least `stale_after` are
-    /// removed. The returned count is removals; quarantined entries are counted
-    /// separately by [`EffectStore::quarantine_entries`].
-    fn scavenge(&self, stale_after: Duration) -> Result<usize, AcceptError> {
-        let mut removed = 0;
+    /// So the action is now governed by [`UndatedPolicy`], fixed at open time:
+    ///
+    /// - [`UndatedPolicy::Report`] — the default for concurrent use. The entry
+    ///   is left exactly where it is and counted. Nothing is claimed about it.
+    /// - [`UndatedPolicy::Quarantine`] — reachable only through
+    ///   [`EffectStore::open_exclusive`], where the caller has asserted that no
+    ///   other attempt is in flight. That assertion, not the entry's age, is
+    ///   what licenses moving it.
+    ///
+    /// Only entries whose age is known **and** at least `stale_after` are ever
+    /// removed, under either policy. The returned [`ScavengeReport`] keeps the
+    /// three outcomes apart rather than summing them.
+    fn scavenge(&self, stale_after: Duration) -> Result<ScavengeReport, AcceptError> {
+        let mut report = ScavengeReport::default();
         for entry in fs::read_dir(self.staging_dir())? {
             let entry = entry?;
             let metadata = entry.metadata()?;
@@ -495,17 +582,27 @@ impl EffectStore {
                 // Known age, old enough: this is the only case age actually
                 // licenses removing.
                 Some(age) if age >= stale_after => {
-                    if fs::remove_file(entry.path()).is_ok() {
-                        removed += 1;
-                    }
+                    // A reap that fails is reported, not silently miscounted.
+                    // This used to be `if remove_file(..).is_ok()`, which turned
+                    // a permission or I/O failure into "there was nothing to
+                    // remove" and left debris nothing had reported.
+                    Self::remove_name(&entry.path())?;
+                    report.removed += 1;
                 }
                 // Known age, too young: leave it, it may be a live attempt.
                 Some(_) => {}
-                // Age unknown or in the future: no evidence either way.
-                None => self.quarantine(&entry.path())?,
+                // Age unknown or in the future: no evidence either way, so what
+                // happens next is decided by exclusivity, not by the entry.
+                None => match self.undated {
+                    UndatedPolicy::Report => report.undated_left_in_place += 1,
+                    UndatedPolicy::Quarantine => {
+                        self.quarantine(&entry.path())?;
+                        report.quarantined += 1;
+                    }
+                },
             }
         }
-        Ok(removed)
+        Ok(report)
     }
 
     /// Moves an entry whose age could not be established out of `tmp/`.
@@ -705,11 +802,15 @@ impl EffectStore {
             });
         drop(file);
         if let Err(error) = staged {
-            // Deliberately discarded, unlike the cleanup in `link_staged`: this
-            // path is already failing, and the write error is the cause the
-            // caller needs. A failure to remove leaves debris in `tmp/`, which
-            // is exactly what scavenging exists for.
-            let _ = fs::remove_file(&staging);
+            // The cleanup runs through the same postcondition as every other
+            // unlink here, and its outcome is *subordinated*, not discarded.
+            // `link_staged` already establishes the rule: a primary failure
+            // wins, because it is the cause the caller needs. What differs from
+            // the old `let _ = fs::remove_file(..)` is that the subordination is
+            // now a stated policy at one place rather than an anonymous
+            // discard at each. Residual debris in `tmp/` is what scavenging is
+            // for, and this attempt has already reported an error.
+            let _cleanup_is_subordinate_to_the_write_error = Self::remove_name(&staging);
             return Err(AcceptError::Io(error));
         }
         Ok(staging)
@@ -1155,7 +1256,10 @@ fn live_staging_file_may_be_reaped_and_the_attempt_fails_loudly() -> Result<(), 
 
         assert_eq!(
             recipient.scavenge(Duration::ZERO)?,
-            1,
+            ScavengeReport {
+                removed: 1,
+                ..ScavengeReport::default()
+            },
             "age alone cannot tell a live stage from debris"
         );
         assert!(!staging.exists(), "the live stage was reaped");
@@ -1211,7 +1315,10 @@ fn live_staging_file_may_be_reaped_and_the_attempt_fails_loudly() -> Result<(), 
         let scratch = ScratchRoot::create()?;
         let recipient = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
         let staging = recipient.stage(&receipt)?;
-        assert_eq!(recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?, 0);
+        assert_eq!(
+            recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?,
+            ScavengeReport::default()
+        );
         assert!(staging.exists(), "a fresh stage is not stale");
         let target = recipient.record_path(&appended.id)?;
         assert!(matches!(
@@ -1559,7 +1666,10 @@ fn future_dated_staging_files_are_quarantined_rather_than_reaped() -> Result<(),
     // delete it.
     assert_eq!(
         recipient.scavenge(Duration::ZERO)?,
-        0,
+        ScavengeReport {
+            quarantined: 1,
+            ..ScavengeReport::default()
+        },
         "an unknown age is not evidence of staleness"
     );
     assert!(!staging.exists(), "the entry left the staging namespace");
@@ -1577,15 +1687,88 @@ fn future_dated_staging_files_are_quarantined_rather_than_reaped() -> Result<(),
     assert_eq!(recipient.read_record(&preserved.path())?, receipt);
 
     // Repeated passes do not re-quarantine or lose anything.
-    assert_eq!(recipient.scavenge(Duration::ZERO)?, 0);
+    assert_eq!(
+        recipient.scavenge(Duration::ZERO)?,
+        ScavengeReport::default()
+    );
     assert_eq!(recipient.quarantine_entries()?, 1);
 
     // A known-age entry alongside it is still reaped normally, so quarantining
     // did not disable the scavenger.
     let ordinary = recipient.stage(&receipt)?;
-    assert_eq!(recipient.scavenge(Duration::ZERO)?, 1);
+    assert_eq!(
+        recipient.scavenge(Duration::ZERO)?,
+        ScavengeReport {
+            removed: 1,
+            ..ScavengeReport::default()
+        }
+    );
     assert!(!ordinary.exists());
     assert_eq!(recipient.quarantine_entries()?, 1);
+    Ok(())
+}
+
+/// A concurrent store leaves an entry it cannot date for whoever owns it.
+///
+/// Unknown age is no evidence of abandonment. The scavenger already classified
+/// it that way and then moved the entry anyway — a rename out of `tmp/` takes
+/// the staging name from its owner exactly as a delete does, and the owner's
+/// `hard_link` failed with `NotFound`. The belief was right and the act was
+/// wrong, and it cost an independently-owned commit.
+///
+/// The claim is checked by the owner *finishing*, not by inspecting directories.
+/// A live stage is future-dated so its age becomes unestablishable, a second
+/// store opened against the same root scavenges around it, and the original
+/// owner then links successfully. Without the fix the link fails, which is the
+/// exact failure the old code inflicted on a live courier.
+#[cfg(unix)]
+#[test]
+fn concurrent_scavenging_leaves_an_undated_stage_for_its_owner() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let receipt = acceptance_receipt(&appended);
+
+    let scratch = ScratchRoot::create()?;
+    let owner = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
+    let staging = owner.stage(&receipt)?;
+
+    // A clock step or a nonmonotonic filesystem: `duration_since` fails, so the
+    // age is unknown. The file is nonetheless live work with an owner mid-commit.
+    let future = SystemTime::now() + Duration::from_secs(3600);
+    File::options()
+        .write(true)
+        .open(&staging)?
+        .set_times(fs::FileTimes::new().set_modified(future))?;
+
+    // A second courier process opens the same root and scavenges around it. Its
+    // open runs a pass of its own, so this covers both entry points.
+    let other = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
+    assert_eq!(
+        other.scavenge(MIN_CONCURRENT_STALE_AFTER)?,
+        ScavengeReport {
+            undated_left_in_place: 1,
+            ..ScavengeReport::default()
+        },
+        "an entry with no establishable age is reported, never moved"
+    );
+    assert!(
+        staging.exists(),
+        "the owner's staging name is still its own"
+    );
+    assert_eq!(other.quarantine_entries()?, 0, "nothing was relocated");
+    assert_eq!(other.staging_entries()?, 1);
+
+    // The owner completes its commit. This is what the rename used to break.
+    let target = owner.record_path(&appended.id)?;
+    assert!(matches!(
+        owner.link_staged(&staging, &target)?,
+        Commit::Linked
+    ));
+    assert_eq!(owner.receipts()?, vec![receipt]);
+    assert_eq!(owner.staging_entries()?, 0);
     Ok(())
 }
 
@@ -1605,7 +1788,10 @@ fn known_young_staging_files_are_neither_reaped_nor_quarantined() -> Result<(), 
     let recipient = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
     let staging = recipient.stage(&acceptance_receipt(&appended))?;
 
-    assert_eq!(recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?, 0);
+    assert_eq!(
+        recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?,
+        ScavengeReport::default()
+    );
     assert!(staging.exists(), "a fresh stage is live work");
     assert_eq!(recipient.quarantine_entries()?, 0);
     Ok(())
