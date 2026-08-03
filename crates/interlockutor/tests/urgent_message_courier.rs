@@ -116,6 +116,13 @@ const MIN_CONCURRENT_STALE_AFTER: Duration = Duration::from_secs(60);
 /// Filenames must fit the common single-component limit of 255 bytes.
 const MAX_NAME_BYTES: usize = 255;
 
+/// How many colliding quarantine names to try before giving up and reporting.
+///
+/// Bounded rather than unbounded so a pathological directory cannot make a
+/// scavenging pass spin forever. Exhausting it is reported, never resolved by
+/// overwriting something.
+const QUARANTINE_NAME_ATTEMPTS: u32 = 1024;
+
 const TOPIC: &str = "urgent-messages";
 
 #[derive(Default)]
@@ -605,23 +612,73 @@ impl EffectStore {
         Ok(report)
     }
 
-    /// Moves an entry whose age could not be established out of `tmp/`.
+    /// Moves an entry out of `tmp/` without ever overwriting one already there.
     ///
-    /// A collision in `quarantine/` means an earlier pass already preserved a
-    /// file under that name; the newer one is kept alongside under a suffixed
-    /// name rather than overwriting evidence.
-    fn quarantine(&self, staging: &Path) -> Result<(), AcceptError> {
+    /// # No-clobber is the point of this directory, not a nicety
+    ///
+    /// The whole purpose of `quarantine/` is to be the thing that survives.
+    /// A publication that can replace an existing entry is not a storage bug in
+    /// this directory — it is the feature negating its own reason to exist.
+    ///
+    /// The previous implementation chose a name with `while target.exists()` and
+    /// then took it with `fs::rename`. Both halves are wrong for that purpose:
+    ///
+    /// - **Check-then-act.** Everything learned by `exists()` is stale by the
+    ///   time `rename` runs. Two passes can both observe the same name free.
+    /// - **The tiebreak was process-local.** Collisions were resolved with a
+    ///   counter held in this process, so two processes resolving the same
+    ///   collision resolve it to the *same* name. Restarts make that reachable
+    ///   rather than theoretical: staging names are process id and counter, and
+    ///   both reset when a process restarts.
+    /// - **`rename` replaces silently.** On unix it unlinks whatever is at the
+    ///   destination. There is no flag on `std::fs::rename` to refuse.
+    ///
+    /// Publication is now `fs::hard_link`, which fails with `AlreadyExists`
+    /// instead of replacing. A free name is therefore *claimed* rather than
+    /// observed to be free, and the claim and the check are one operation, so
+    /// there is no window between them. Losing the race is not an error: the
+    /// next candidate name is tried.
+    ///
+    /// `renameat2(RENAME_NOREPLACE)` would be the single-syscall form, but it is
+    /// Linux-specific and `std` does not expose it. Link-then-unlink is the
+    /// portable POSIX idiom for the same guarantee.
+    ///
+    /// The unlink of the original name is *not* part of the atomic step, and
+    /// does not need to be. If it fails, the entry exists in both places and the
+    /// error is reported; a later pass files the surviving `tmp/` entry beside
+    /// the first under a fresh name. That duplicates bytes, which is the
+    /// direction this directory is allowed to fail in.
+    ///
+    /// Returns the name the entry was published under.
+    fn quarantine(&self, staging: &Path) -> Result<PathBuf, AcceptError> {
         let name = staging
             .file_name()
             .expect("a staging entry always has a file name");
-        let mut target = self.quarantine_dir().join(name);
-        while target.exists() {
-            let mut next = name.to_os_string();
-            next.push(format!(".{}", STAGING_ID.fetch_add(1, Ordering::Relaxed)));
-            target = self.quarantine_dir().join(next);
+        let dir = self.quarantine_dir();
+        for attempt in 0..QUARANTINE_NAME_ATTEMPTS {
+            let mut candidate = name.to_os_string();
+            if attempt > 0 {
+                candidate.push(format!(".{attempt}"));
+            }
+            let target = dir.join(candidate);
+            match fs::hard_link(staging, &target) {
+                Ok(()) => {
+                    Self::remove_name(staging)?;
+                    return Ok(target);
+                }
+                // Somebody else holds this name. Nothing was touched; try the
+                // next one. This is the branch that used to be a silent replace.
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(AcceptError::Io(error)),
+            }
         }
-        fs::rename(staging, &target)?;
-        Ok(())
+        Err(AcceptError::Io(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            format!(
+                "no free quarantine name for {} within {QUARANTINE_NAME_ATTEMPTS} attempts",
+                Path::new(name).display()
+            ),
+        )))
     }
 
     /// Records the effect for `event` exactly once, keyed by [`EventId`].
@@ -1705,6 +1762,123 @@ fn future_dated_staging_files_are_quarantined_rather_than_reaped() -> Result<(),
     );
     assert!(!ordinary.exists());
     assert_eq!(recipient.quarantine_entries()?, 1);
+    Ok(())
+}
+
+/// Creates `count` same-named entries with distinct bodies, in sibling dirs.
+///
+/// Same basename is what forces the collision, and a directory each is the only
+/// way to have several at once — which is also how the collision arises in
+/// practice, since a restarted process reuses staging names.
+fn colliding_sources(root: &Path, count: usize) -> io::Result<Vec<(PathBuf, Vec<u8>)>> {
+    (0..count)
+        .map(|index| {
+            let dir = root.join(format!("attempt-{index}"));
+            fs::create_dir_all(&dir)?;
+            let path = dir.join("s1234-0");
+            let body = format!("evidence-{index}").into_bytes();
+            fs::write(&path, &body)?;
+            Ok((path, body))
+        })
+        .collect()
+}
+
+/// Publishing into `quarantine/` must never overwrite what is already there.
+///
+/// This directory exists to be the thing that survives, so a publication that
+/// can replace an entry is not a storage bug — it is the feature negating its
+/// own purpose. `while target.exists()` followed by `fs::rename` could do
+/// exactly that: the check is stale before the act, the collision tiebreak was a
+/// process-local counter so two processes pick the same "fresh" name, and unix
+/// `rename` replaces the destination silently.
+///
+/// The collision is *forced* rather than raced for: every entry shares one file
+/// name, so every publication after the first collides. What is asserted is not
+/// that the names differ but that every distinct byte string is still readable.
+#[cfg(unix)]
+#[test]
+fn quarantine_publication_never_overwrites_existing_evidence() -> Result<(), Box<dyn StdError>> {
+    const ENTRIES: usize = 4;
+
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?;
+    let sources = colliding_sources(scratch.path(), ENTRIES)?;
+
+    let mut published = Vec::new();
+    for (path, _) in &sources {
+        published.push(recipient.quarantine(path)?);
+        assert!(!path.exists(), "the entry left its original name");
+    }
+
+    let mut names = published.clone();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), ENTRIES, "each collision took a distinct name");
+    assert_eq!(recipient.quarantine_entries()?, ENTRIES);
+
+    // The promise is the bytes, not the names.
+    let mut survived = published
+        .iter()
+        .map(fs::read)
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut expected: Vec<_> = sources.into_iter().map(|(_, body)| body).collect();
+    survived.sort();
+    expected.sort();
+    assert_eq!(survived, expected, "every distinct body survived");
+    Ok(())
+}
+
+/// The same collision, resolved concurrently, still loses nothing.
+///
+/// The forced-collision case above is deterministic but sequential, so it cannot
+/// exercise the window the old shape actually opened: two publications both
+/// observing a name free and both taking it. Here every thread races for the
+/// same first name. `hard_link` makes losing the race a refusal rather than a
+/// replacement, so the loser retries and every body survives on every
+/// interleaving — which is why this is asserted rather than sampled.
+#[cfg(unix)]
+#[test]
+fn concurrent_quarantine_publication_loses_nothing() -> Result<(), Box<dyn StdError>> {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 16;
+
+    for round in 0..ROUNDS {
+        let scratch = ScratchRoot::create()?;
+        let recipient = Arc::new(EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?);
+        let sources = colliding_sources(scratch.path(), THREADS)?;
+        let barrier = Arc::new(Barrier::new(THREADS));
+
+        let handles: Vec<_> = sources
+            .iter()
+            .map(|(path, _)| {
+                let recipient = recipient.clone();
+                let barrier = barrier.clone();
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    recipient.quarantine(&path)
+                })
+            })
+            .collect();
+        let published = handles
+            .into_iter()
+            .map(|handle| handle.join().expect("quarantine thread should not panic"))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        assert_eq!(
+            recipient.quarantine_entries()?,
+            THREADS,
+            "round {round}: one entry per publication"
+        );
+        let mut survived = published
+            .iter()
+            .map(fs::read)
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut expected: Vec<_> = sources.into_iter().map(|(_, body)| body).collect();
+        survived.sort();
+        expected.sort();
+        assert_eq!(survived, expected, "round {round}: no body was replaced");
+    }
     Ok(())
 }
 

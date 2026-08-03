@@ -242,6 +242,25 @@ The format is based on [Keep a Changelog], and this project adheres to
   removals, relocations, and untouched-undated entries apart instead of summing
   them.
 
+- Quarantine publication can no longer overwrite the entry it is preserving.
+  The target name was chosen with `while target.exists()` and then taken with
+  `fs::rename`. The check is stale before the act; the collision tiebreak was a
+  process-local counter, so two processes resolving the same collision resolve
+  it to the same name — reachable rather than theoretical, since staging names
+  are process id and counter and both reset across a restart; and unix `rename`
+  replaces the destination silently. A directory whose entire purpose is to be
+  the thing that survives cannot have a publication step that can replace what
+  is already in it: that is not a storage bug, it is the feature negating its
+  own purpose.
+
+  Publication is now `fs::hard_link`, which refuses an existing name instead of
+  replacing it, so a free name is claimed rather than observed to be free and
+  there is no window between the two. A collision is retried, never resolved by
+  overwriting, and the retry budget is bounded and reported if exhausted. Two
+  tests cover it: a deterministic forced collision where every entry shares one
+  file name, and a concurrent one where every thread races for the same first
+  name. Both assert that every distinct byte string is still readable.
+
 - The scavenger reports a failed reap instead of dropping it. Deletion was
   `if fs::remove_file(..).is_ok()`, which turned a permission or I/O failure
   into "there was nothing to remove" and left debris that nothing had reported.
