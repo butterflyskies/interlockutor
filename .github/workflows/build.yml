@@ -33,8 +33,15 @@ jobs:
           echo "8e38b16299864c9f597c9a1e2caf25b7e8b598ffc659ec014c2c735a9befd8fa  /tmp/cargo-nextest.tar.gz" | sha256sum -c -
           tar xzf /tmp/cargo-nextest.tar.gz -C /usr/local/bin
       - run: cargo fmt --check
-      - run: cargo clippy -- -D warnings
+      - run: cargo clippy --all-targets -- -D warnings
+      # Runs the trybuild UI tests in crates/interlockutor/tests/ui, which are
+      # the enforced form of the crate's compile-fail security guards.
       - run: cargo nextest run --workspace --no-fail-fast
+      # Belt-and-braces for any remaining doctests. Nextest does not run
+      # doctests, so without this step a doctest can rot unnoticed. The
+      # compile-fail guards deliberately do not live here: a `compile_fail`
+      # doctest cannot pin which error it failed with.
+      - run: cargo test --workspace --doc
 
   msrv:
     runs-on: ubuntu-latest

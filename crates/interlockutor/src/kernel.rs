@@ -227,9 +227,14 @@ pub(super) fn classify_replay<Id: Eq, Topic: Eq, Payload: Eq>(
 /// The premise is now discharged outside this file, by the type system:
 /// [`crate::Lease`] is unconstructable outside the crate and
 /// [`crate::ClaimOutcome::Contended`] no longer discloses the fence. That is a
-/// compile-time property, so it is covered by `compile_fail` doctests rather
-/// than by a harness. State it here so nobody reads "the kernel is proven" as
-/// "token provenance is proven".
+/// compile-time property, so it is covered by the trybuild UI tests in
+/// `tests/ui/` rather than by a harness. State it here so nobody reads "the
+/// kernel is proven" as "token provenance is proven".
+///
+/// Those guards were `compile_fail` doctests until they were found to be
+/// unenforced: CI's runner does not execute doctests, and a pinned error code on
+/// a `compile_fail` block is silently ignored on stable. See
+/// `tests/compile_fail.rs`.
 #[cfg(kani)]
 mod proofs {
     use super::*;

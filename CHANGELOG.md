@@ -117,6 +117,41 @@ The format is based on [Keep a Changelog], and this project adheres to
 - `AcceptError::UnusableRecord` retains the underlying parse or I/O failure as
   an `Error::source` instead of flattening it into a message string.
 
+- **Security (CI enforcement):** the three compile-fail guards protecting the
+  lease-forgery fix are now enforced. They were `compile_fail` doctests, and
+  were unenforced in two independent ways:
+
+  1. **CI never ran them.** `build.yml` runs `cargo nextest run`, and nextest
+     does not execute doctests; there was no `cargo test --doc` step anywhere.
+     A change restoring public `Lease` construction or re-disclosing
+     `ClaimOutcome::Contended::fence` would have merged green.
+  2. **The error was unpinned.** `compile_fail,CODE` does not self-enforce on
+     stable — error-code checking is nightly-gated, so the code is parsed and
+     silently ignored. Negative control on rustc 1.95.0: pinning a deliberately
+     wrong code (`E0308`) on all three doctests still reported `3 passed;
+     0 failed`, indistinguishable from a correct pin.
+
+  The guards are now trybuild UI tests under `crates/interlockutor/tests/ui`
+  with committed `.stderr` files, so the exact diagnostic is pinned and a guard
+  that starts failing for an unrelated reason goes red. They are ordinary
+  `#[test]`s, so nextest runs them with no extra CI step. CI additionally gained
+  `cargo clippy --all-targets` and a `cargo test --workspace --doc` step as
+  belt-and-braces for the remaining doctests.
+
+  **The `EventStoreExt` sealing guard was vacuous and has been rebuilt.** Its
+  `struct Backend;` never implemented the required `EventStore` supertrait, so
+  it failed on the missing bound rather than on the seal — verified by removing
+  the seal *and* the blanket impl entirely and watching the old snippet still
+  fail to compile. The replacement uses a backend that fully implements
+  `EventStore`, so the only remaining error is the substitution itself.
+
+  That rebuild also corrected a doc claim: what rejects a substituted `claim`
+  body is **coherence (`E0119`) against the blanket impl**, not the private
+  sealed supertrait. `sealed::Sealed` is blanket-implemented for
+  `T: EventStore + ?Sized`, the same bound as `EventStoreExt`'s blanket impl, so
+  it is satisfied exactly when `EventStore` is and excludes no type on its own.
+  The guarantee is unchanged and real; the attribution was wrong.
+
 ## [0.3.0] - 2026-07-24
 
 ### Changed

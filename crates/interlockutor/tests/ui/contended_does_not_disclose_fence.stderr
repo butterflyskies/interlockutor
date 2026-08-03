@@ -1,0 +1,5 @@
+error[E0026]: variant `Contended` does not have a field named `fence`
+  --> tests/ui/contended_does_not_disclose_fence.rs:12:35
+   |
+12 |         ClaimOutcome::Contended { fence, .. } => Some(*fence),
+   |                                   ^^^^^ variant `Contended` does not have this field

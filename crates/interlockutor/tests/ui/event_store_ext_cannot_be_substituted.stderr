@@ -1,0 +1,9 @@
+error[E0119]: conflicting implementations of trait `EventStoreExt` for type `Backend`
+  --> tests/ui/event_store_ext_cannot_be_substituted.rs:81:1
+   |
+81 | impl EventStoreExt for Backend {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: conflicting implementation in crate `interlockutor`:
+           - impl<T> EventStoreExt for T
+             where T: EventStore, T: ?Sized;

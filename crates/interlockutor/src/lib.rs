@@ -199,20 +199,20 @@ pub struct Fence(pub u64);
 ///
 /// # Forging a lease does not compile
 ///
-/// ```compile_fail
-/// use interlockutor::{ConsumerId, Event, Fence, Lease};
+/// A losing claimant has the canonical event and the disclosed holder, and still
+/// cannot build the winner's lease:
 ///
-/// // A losing claimant has the canonical event and the disclosed holder, and
-/// // still cannot build the winner's lease: the fields are private.
+/// ```ignore
 /// fn forge(event: Event, holder: ConsumerId) -> Lease {
-///     Lease {
-///         event,
-///         owner: holder,
-///         fence: Fence(1),
-///         expires_at: u64::MAX,
-///     }
+///     Lease { event, owner: holder, fence: Fence(1), expires_at: u64::MAX }
 /// }
 /// ```
+///
+/// That is enforced by the trybuild case `tests/ui/lease_is_unconstructable.rs`,
+/// whose committed `.stderr` pins the exact `E0451`. It is a UI test rather than
+/// a `compile_fail` doctest because doctests are not run by CI's test runner and
+/// because `compile_fail,E0451` does not self-enforce on stable. See
+/// `tests/compile_fail.rs`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
     event: Event,
@@ -291,9 +291,7 @@ impl Lease {
 ///
 /// # Reading a fence off a contended outcome does not compile
 ///
-/// ```compile_fail
-/// use interlockutor::{ClaimOutcome, Fence};
-///
+/// ```ignore
 /// fn holders_fence(outcome: &ClaimOutcome) -> Option<Fence> {
 ///     match outcome {
 ///         ClaimOutcome::Contended { fence, .. } => Some(*fence),
@@ -301,6 +299,10 @@ impl Lease {
 ///     }
 /// }
 /// ```
+///
+/// Enforced by `tests/ui/contended_does_not_disclose_fence.rs`, whose committed
+/// `.stderr` pins the exact `E0026`. See `tests/compile_fail.rs` for why these
+/// guards are UI tests rather than `compile_fail` doctests.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
     /// The caller now holds the lease described here.
@@ -576,20 +578,30 @@ mod sealed {
 /// Backends implement [`EventStore`] and get this for free. Callers need
 /// `EventStoreExt` in scope to call [`EventStoreExt::claim`].
 ///
+/// # What enforces this is coherence; the seal is belt-and-braces
+///
+/// Stated precisely, because "sealed by a private supertrait" over-credits the
+/// seal. [`sealed::Sealed`] is blanket-implemented for `T: EventStore + ?Sized`
+/// — the same bound as the blanket `EventStoreExt` impl — so it is satisfied
+/// exactly when `EventStore` is and excludes no type on its own. A backend that
+/// implements `EventStore` is already covered by the blanket impl, so a second
+/// body is a coherence error (`E0119`) before sealing is consulted; a type that
+/// does not implement `EventStore` is rejected by the supertrait bound. Either
+/// way the substitution is impossible, which is what the doc promises.
+///
 /// # Substituting the projection does not compile
 ///
-/// ```compile_fail
-/// use interlockutor::{ConsumerId, Error, EventStoreExt, Lease, Topic};
-/// use std::time::Duration;
-///
-/// struct Backend;
-///
-/// impl EventStoreExt for Backend {
-///     fn claim(&self, _: &ConsumerId, _: &Topic, _: Duration) -> Result<Option<Lease>, Error> {
-///         Ok(None)
-///     }
+/// ```ignore
+/// impl EventStoreExt for Backend {          // Backend: EventStore already
+///     fn claim(&self, ..) -> Result<Option<Lease>, Error> { Ok(None) }
 /// }
 /// ```
+///
+/// Enforced by `tests/ui/event_store_ext_cannot_be_substituted.rs`. That case
+/// uses a backend that **does** implement [`EventStore`]; an earlier version
+/// used a bare `struct Backend;` that did not, which made the guard vacuous —
+/// it failed on the missing supertrait and would have failed identically with no
+/// protection at all.
 pub trait EventStoreExt: EventStore + sealed::Sealed {
     /// Claims the first available event, discarding why a claim failed.
     ///
