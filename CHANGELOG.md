@@ -7,6 +7,12 @@ The format is based on [Keep a Changelog], and this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Added a domain-neutral urgent-message dogfood trace proving one live courier
+  lease, at-least-once redelivery after a lost queue acknowledgement, stale
+  fence rejection, and recipient-idempotent once-only acceptance.
+
 ### Changed
 
 - Replaced the leased-work transition internals with a small semantic kernel
