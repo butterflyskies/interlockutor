@@ -15,6 +15,10 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod kernel;
+
+use kernel::{Claim, LeaseError, LeaseKernel, Replay, classify_replay};
+
 /// Monotonic time in milliseconds from an implementation-defined epoch.
 pub type Timestamp = u64;
 
@@ -260,6 +264,12 @@ pub trait EventStore: Send + Sync {
         sequence: u64,
     ) -> Result<BroadcastAck, Error>;
 
+    /// Claims the first available event.
+    ///
+    /// A positive duration whose expiration cannot be represented is rejected
+    /// as [`Error::InvalidLeaseDuration`]. If an item's `u64` fencing-token
+    /// space is exhausted, that item remains permanently unavailable and the
+    /// search continues with later events.
     fn claim(
         &self,
         consumer: &ConsumerId,
@@ -267,10 +277,18 @@ pub trait EventStore: Send + Sync {
         lease_for: Duration,
     ) -> Result<Option<Lease>, Error>;
 
+    /// Renews a current lease without changing its owner or fence.
     fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error>;
+
+    /// Makes work terminal in this store; it does not transact external effects.
+    ///
+    /// A successful acknowledgement is not itself retry-idempotent: calling
+    /// this method again with the consumed lease returns [`Error::NotLeaseOwner`].
+    /// Callers that need a durable receipt must retain the returned [`WorkAck`].
     fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error>;
 
-    /// Releases work immediately. The next claim receives a higher fence.
+    /// Releases work immediately. The next claim receives a higher fence
+    /// unless this lease consumed the last fencing token.
     fn nack_work(&self, lease: &Lease) -> Result<(), Error>;
 }
 
@@ -287,21 +305,7 @@ struct State {
     idempotency: HashMap<IdempotencyKey, Event>,
     event_ids: HashMap<EventId, IdempotencyKey>,
     cursors: HashMap<(ConsumerId, Topic), u64>,
-    work: HashMap<EventId, WorkState>,
-}
-
-#[derive(Clone, Debug, Default)]
-struct WorkState {
-    fence: u64,
-    lease: Option<LeaseState>,
-    acknowledged: bool,
-}
-
-#[derive(Clone, Debug)]
-struct LeaseState {
-    owner: ConsumerId,
-    fence: Fence,
-    expires_at: Timestamp,
+    work: HashMap<EventId, LeaseKernel<ConsumerId>>,
 }
 
 impl MemoryStore {
@@ -320,11 +324,12 @@ impl MemoryStore {
     }
 
     fn expiry_from(now: Timestamp, duration: Duration) -> Result<Timestamp, Error> {
-        let millis = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        let millis =
+            u64::try_from(duration.as_millis()).map_err(|_| Error::InvalidLeaseDuration)?;
         if millis == 0 {
             return Err(Error::InvalidLeaseDuration);
         }
-        Ok(now.saturating_add(millis))
+        now.checked_add(millis).ok_or(Error::InvalidLeaseDuration)
     }
 
     fn validate_lease(state: &State, lease: &Lease, now: Timestamp) -> Result<(), Error> {
@@ -336,18 +341,12 @@ impl MemoryStore {
         if canonical != &lease.event {
             return Err(Error::UnknownEvent);
         }
-        let work = state.work.get(&lease.event.id).ok_or(Error::UnknownEvent)?;
-        let active = work.lease.as_ref().ok_or(Error::NotLeaseOwner)?;
-        if active.fence != lease.fence {
-            return Err(Error::StaleFence);
-        }
-        if active.owner != lease.owner {
-            return Err(Error::NotLeaseOwner);
-        }
-        if active.expires_at <= now {
-            return Err(Error::LeaseExpired);
-        }
-        Ok(())
+        state
+            .work
+            .get(&lease.event.id)
+            .ok_or(Error::UnknownEvent)?
+            .validate(&lease.owner, lease.fence, now)
+            .map_err(map_lease_error)
     }
 }
 
@@ -358,9 +357,10 @@ impl EventStore for MemoryStore {
         }
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         if let Some(existing) = state.idempotency.get(&event.idempotency_key) {
-            if existing.id != event.id
-                || existing.topic != event.topic
-                || existing.payload != event.payload
+            if classify_replay(
+                (&existing.id, &existing.topic, &existing.payload),
+                (&event.id, &event.topic, &event.payload),
+            ) == Replay::Conflict
             {
                 return Err(Error::IdempotencyKeyConflict {
                     key: event.idempotency_key,
@@ -389,7 +389,7 @@ impl EventStore for MemoryStore {
         state
             .idempotency
             .insert(stored.idempotency_key.clone(), stored.clone());
-        state.work.insert(stored.id.clone(), WorkState::default());
+        state.work.insert(stored.id.clone(), LeaseKernel::default());
         state
             .topics
             .entry(stored.topic.clone())
@@ -479,29 +479,17 @@ impl EventStore for MemoryStore {
                 .work
                 .get_mut(&event.id)
                 .expect("work state exists for event");
-            if work.acknowledged {
-                continue;
+            match work.claim(consumer.clone(), now, expires_at) {
+                Claim::Granted(lease) => {
+                    return Ok(Some(Lease {
+                        event,
+                        owner: lease.owner,
+                        fence: lease.fence,
+                        expires_at: lease.expires_at,
+                    }));
+                }
+                Claim::Unavailable | Claim::FenceExhausted => continue,
             }
-            if work
-                .lease
-                .as_ref()
-                .is_some_and(|lease| lease.expires_at > now)
-            {
-                continue;
-            }
-            work.fence = work.fence.checked_add(1).expect("fencing token exhausted");
-            let fence = Fence(work.fence);
-            work.lease = Some(LeaseState {
-                owner: consumer.clone(),
-                fence,
-                expires_at,
-            });
-            return Ok(Some(Lease {
-                event,
-                owner: consumer.clone(),
-                fence,
-                expires_at,
-            }));
         }
         Ok(None)
     }
@@ -517,16 +505,16 @@ impl EventStore for MemoryStore {
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
         Self::validate_lease(&state, lease, now)?;
-        state
+        let renewed = state
             .work
             .get_mut(&lease.event.id)
-            .expect("validated")
-            .lease
-            .as_mut()
-            .expect("validated")
-            .expires_at = expires_at;
+            .ok_or(Error::UnknownEvent)?
+            .renew(&lease.owner, lease.fence, now, expires_at)
+            .map_err(map_lease_error)?;
         Ok(Lease {
-            expires_at,
+            owner: renewed.owner,
+            fence: renewed.fence,
+            expires_at: renewed.expires_at,
             ..lease.clone()
         })
     }
@@ -541,9 +529,12 @@ impl EventStore for MemoryStore {
         let mut state = self.state.lock().expect("memory store mutex poisoned");
         let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
-        let work = state.work.get_mut(&lease.event.id).expect("validated");
-        work.acknowledged = true;
-        work.lease = None;
+        state
+            .work
+            .get_mut(&lease.event.id)
+            .expect("validated")
+            .acknowledge(&lease.owner, lease.fence, now)
+            .expect("validated");
         Ok(WorkAck {
             event_id: lease.event.id.clone(),
             owner: lease.owner.clone(),
@@ -565,9 +556,18 @@ impl EventStore for MemoryStore {
         state
             .work
             .get_mut(&lease.event.id)
-            .expect("validated")
-            .lease = None;
+            .ok_or(Error::UnknownEvent)?
+            .release(&lease.owner, lease.fence, now)
+            .map_err(map_lease_error)?;
         Ok(())
+    }
+}
+
+fn map_lease_error(error: LeaseError) -> Error {
+    match error {
+        LeaseError::NotLeased | LeaseError::NotOwner => Error::NotLeaseOwner,
+        LeaseError::StaleFence => Error::StaleFence,
+        LeaseError::Expired => Error::LeaseExpired,
     }
 }
 

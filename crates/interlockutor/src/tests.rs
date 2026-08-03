@@ -389,6 +389,89 @@ fn zero_duration_is_rejected() {
 }
 
 #[test]
+fn timestamp_overflow_is_rejected_without_creating_a_lease() {
+    let (store, clock) = fixture();
+    append(&store, "job", "work");
+    clock.set(u64::MAX);
+
+    assert_eq!(
+        store.claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(1),
+        ),
+        Err(Error::InvalidLeaseDuration)
+    );
+}
+
+#[test]
+fn duration_larger_than_the_timestamp_domain_is_rejected() {
+    let (store, _) = fixture();
+    append(&store, "job", "work");
+
+    assert_eq!(
+        store.claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_secs(u64::MAX),
+        ),
+        Err(Error::InvalidLeaseDuration)
+    );
+}
+
+#[test]
+fn exhausted_fence_skips_the_item_without_panicking() {
+    let (store, _) = fixture();
+    let first = append(&store, "first", "work");
+    let second = append(&store, "second", "work");
+    store
+        .state
+        .lock()
+        .unwrap()
+        .work
+        .insert(first.id, LeaseKernel::available_after(Fence(u64::MAX)));
+
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .unwrap();
+
+    assert_eq!(lease.event, second);
+    assert_eq!(lease.fence, Fence(1));
+}
+
+#[test]
+fn successful_work_ack_is_terminal_but_not_retry_idempotent() {
+    let (store, _) = fixture();
+    append(&store, "job", "work");
+    let lease = store
+        .claim(
+            &ConsumerId("worker".into()),
+            &Topic("work".into()),
+            Duration::from_millis(1),
+        )
+        .unwrap()
+        .unwrap();
+
+    store.ack_work(&lease).unwrap();
+    assert_eq!(store.ack_work(&lease), Err(Error::NotLeaseOwner));
+    assert_eq!(
+        store
+            .claim(
+                &ConsumerId("other".into()),
+                &Topic("work".into()),
+                Duration::from_millis(1),
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
 fn many_events_preserve_order_and_are_claimed_once() {
     let (store, _) = fixture();
     let topic = Topic("work".into());
