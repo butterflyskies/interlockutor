@@ -23,6 +23,13 @@ work is never reported as a current holder, and that the lossy `claim`
 projection agrees with the detailed outcome. They do not model authorization,
 locking, persistence, process restart, or transactional external effects.
 
+They also do not model **token provenance**. Each harness reasons about a
+supplied `(owner, fence)` pair; it proves a stale or wrong-owner token cannot
+mutate, not that only the rightful holder can produce a valid one. That premise
+is discharged by the type system instead — `Lease` is unconstructable outside
+the crate — and is checked by `compile_fail` doctests, not by a harness. Read
+"the kernel is proven" as exactly that, and not as "token provenance is proven".
+
 ## Claiming and contention
 
 `EventStore::claim_detailed` is the claim protocol contract. It returns
@@ -31,36 +38,91 @@ a losing claimant can tell "someone else holds this right now" apart from "there
 is nothing to do", and can schedule a retry from the holder's lease expiry
 instead of spinning.
 
-`EventStore::claim` is retained as the lossy compatibility surface: it is a
+`EventStoreExt::claim` is retained as the lossy compatibility surface: it is a
 projection of the same single computation, collapsing `Contended` and `Empty`
 into `None`. It is not the protocol contract, and new consumers should not use
 it.
 
+`EventStoreExt` is a sealed blanket impl over every `EventStore`, not a provided
+trait method. A backend cannot supply a second `claim` body, so the equivalence
+`claim(..) == claim_detailed(..)?.granted()` holds because there is only one
+implementation of it — previously that was a doc claim over an overridable
+method. Callers need `EventStoreExt` in scope; backends implement `EventStore`
+and get the projection for free.
+
 Available work always wins — the scan looks for a grant across the whole topic
-before reporting contention. Because `claim` does not name an `EventId`, a
-contended outcome names the **lowest-sequence** live-contended event.
+before reporting contention. Because `claim_detailed` takes no `EventId`, a
+contended outcome names the **lowest-sequence** live-contended event. That
+holder may be the calling consumer itself, when the caller already holds the
+only live item in the topic.
 
-### Holder disclosure is a deliberate exposure
+### What a contended outcome discloses
 
-`ClaimOutcome::Contended` reveals the current lease owner's `ConsumerId` to any
-caller that can attempt a claim. This is a chosen trade, appropriate to the
-in-process, mutually-trusting consumer model the reference `MemoryStore` serves:
-naming the holder is what makes a scheduled retry possible.
+`ClaimOutcome::Contended` reports `event_id`, `holder`, and `expires_at`. It
+does **not** report the holder's active fence. Naming the holder and the expiry
+is what turns a blind retry into a scheduled one; the fence is internal ordering
+data a losing claimant has no use for.
 
-It becomes an enumeration and reconnaissance surface as soon as a durable or
-networked backend serves mutually-distrusting claimants, because such a
-claimant can attempt claims repeatedly to map who-holds-what. Reporting a single
-lowest-sequence holder rather than the whole contention set keeps that surface
-as small as the contract allows, but a backend with that threat model must gate
-or redact `Contended` under its own policy. The `Authorizer` seam decides only
-whether a consumer may claim a topic, not what it may learn about other
-consumers.
+Holder disclosure remains a deliberate exposure. It is an enumeration and
+reconnaissance surface as soon as a durable or networked backend serves
+mutually-distrusting claimants, because such a claimant can attempt claims
+repeatedly to map who-holds-what. Reporting a single lowest-sequence holder
+rather than the whole contention set keeps that surface as small as the contract
+allows, but a backend with that threat model must gate or redact `Contended`
+under its own policy. The `Authorizer` seam decides only whether a consumer may
+claim a topic, not what it may learn about other consumers.
 
-The disclosed `holder` is a **coordination identifier, not a credential**.
-Possessing another consumer's `ConsumerId` confers no authority: every lease
-mutation requires an exact match on both the active fencing token and the
-recorded owner, so a disclosed holder cannot be replayed to renew, acknowledge,
-release, or steal a lease.
+### Possession is the capability, and that depends on `Lease` being opaque
+
+`Lease` has private fields, no public constructor, and no `Default`,
+`Deserialize`, or `From` impl that rebuilds one from parts. The only ways to
+obtain one are to win a claim or to renew a lease already held. Read-only
+accessors (`event`, `owner`, `fence`, `expires_at`) serve the holder.
+
+`renew`, `ack_work`, and `nack_work` authenticate the **token**, not the
+**caller**. They validate the supplied lease against store state and have no
+notion of who is calling. So a `Lease` is a capability: possessing one *is* the
+authority to mutate that item, and handing one to another component hands over
+that authority. Caller authentication distinct from token possession is
+deliberately not implemented here; a backend that needs mutations bound to an
+authenticated principal must add that binding itself.
+
+**Possession-as-capability requires that the token be unconstructable.
+Otherwise disclosure leaks the capability.**
+
+That dependency is why both changes were needed, and why neither may be relaxed
+alone. Validation gates on an exact match of owner, fence, and canonical event.
+The event is public. When `Contended` disclosed the holder *and* the active
+fence, and `Lease` fields were public, all three checks were satisfiable by a
+constructed lease: a losing claimant could assemble the winner's lease and
+terminally acknowledge work it never performed. Opacity and disclosure are
+coupled — either the token is unconstructable, which makes `(holder, fence)`
+inert data, or the fence must never be disclosed. This crate does both. Do not
+re-add a public lease constructor "because the fence is not disclosed anyway",
+and do not re-disclose the fence "because the lease is opaque anyway".
+
+#### Known break: out-of-crate backends cannot implement `EventStore` right now
+
+`claim_detailed` and `renew` return `Lease` values, and `Lease` is
+unconstructable outside the crate, so a third-party backend cannot produce one.
+Only in-crate backends can implement `EventStore` as of this change. That is a
+real regression against the goal that persistent and distributed backends
+implement the trait and pass the same conformance suite.
+
+It is recorded rather than resolved, because every quick resolution is weaker
+than it looks: a public constructor restores the forgery path; a cargo feature
+is build-time role separation rather than a boundary, since features unify
+across a dependency graph; a sealed minting trait excludes exactly the party
+that needs it. The shape that works is a store-bound lease, valid only against
+the store that issued it, which needs a store-identity concept the crate does
+not have. The seam needs a design decision, and reopening construction to
+unblock an implementor before that decision would reintroduce the vulnerability.
+
+The forgery is now unexpressible rather than merely rejected. `compile_fail`
+doctests on `Lease`, `ClaimOutcome`, and `EventStoreExt` record that, and the
+`lease_forgery` integration trace walks every runtime route a losing claimant
+has. Note that `cargo nextest run` does not execute doctests, so the
+compile-time half needs `cargo test --doc`.
 
 ## Courier dogfood contract
 
@@ -94,17 +156,70 @@ The tests establish:
   in `tmp/` — is invisible as an effect. Stale staging files are scavenged by
   age on reopen.
 - **Caller-supplied `EventId`s are never used as pathnames.** Ids are hex-encoded
-  into one confined, injective path component, and the original id is stored in
-  the record and re-verified before any `Existing` answer.
+  into one confined, injective path component, and the whole record — not just
+  its key — is re-verified before any `Existing` answer.
 - **A damaged record is not a receipt.** An existing path whose body is empty,
-  truncated, or names a different event is reported as a distinct recoverable
-  error, never as a prior acceptance.
-- **The dedup is doing the work.** A negative control running the identical
-  commit protocol with `EventId` keying removed genuinely records twice.
+  truncated, names a different event, or carries a substituted `receipt_id` is
+  reported as a distinct recoverable error, never as a prior acceptance. The
+  check is full-record equality against the receipt the event deterministically
+  produces; matching only the embedded `EventId` accepted any record filed under
+  the right name.
+- **A link that outlived its directory fsync is repaired before it counts.** If
+  `hard_link` succeeds and the `effects/` fsync fails, the entry is visible but
+  possibly not crash-durable and the attempt reports failure. The next attempt
+  re-fsyncs `effects/` *before* validating, and propagates a repeated failure,
+  so no courier acknowledges over an entry that was never made durable. Injected
+  as a fault, not argued.
+- **The keying is doing the deduplication.** Negative control A runs the
+  identical commit protocol with `EventId` keying removed, on a sequential
+  redelivery, and genuinely records twice. It isolates keying only — it is not a
+  race control.
+- **The atomicity is doing the race protection.** Negative control B is a
+  check-then-append recipient whose dedup decision and effect record are two
+  operations. The losing interleaving is *forced* — observe, observe, record,
+  record — rather than sampled under a barrier, so it duplicates on every run.
+  The same two attempts through the atomic protocol record exactly once.
+
+The two negative controls establish different things and are not
+interchangeable. Control A says nothing about concurrency; control B is a forced
+interleaving rather than a sampled race.
 
 The tests do **not** establish crash durability. No in-process test can pull
 power, so the fsync steps are implemented to the standard commit protocol and
 argued, not demonstrated.
+
+### Failure semantics are stated, including the untested cells
+
+The commit protocol was specified as a happy-path sequence, and three defects
+came out of leaving its failure behaviour implied. The per-step failure
+semantics — what is on disk if a step fails, what a retry observes, whether the
+retry reaches a correct terminal state, and which test covers it — are now
+tabulated in the `urgent_message_courier` module docs. Cells that are argued
+rather than injected say so: step-1 and step-3 I/O failures, and crash
+durability itself.
+
+### Scavenging: age is a heuristic, not proof of abandonment
+
+`tmp/` entries untouched for `stale_after` are reaped. This adapter has no
+liveness marker, no advisory lock, and no ownership claim on a staging name, so
+**age cannot distinguish a live attempt from debris**. An earlier version of
+this document and of the code claimed a concurrent courier's staging file was
+never removed. That was untrue, and the claim is now narrowed to the mechanism
+rather than the mechanism strengthened to the claim.
+
+The stated assumption is that no single accept attempt holds a staging file
+longer than `stale_after` between creating it and linking it. An attempt that
+violates it can have its live staging name reaped, after which its `hard_link`
+fails with `NotFound`. The failure is conservative rather than corrupting — the
+attempt fails loudly and records nothing, so the cost is an avoidable retry, not
+a duplicated or lost effect. `EffectStore::open_with` enforces a floor on the
+window; `open_exclusive` is the named escape hatch for recovery-time reaping,
+where the caller supplies exclusivity instead of the heuristic inferring it.
+Both directions are tested against a genuinely live stage, not simulated debris.
+
+Making this exact needs real ownership evidence — an advisory lock, a liveness
+marker, or linking from an open descriptor so the pathname stops mattering.
+That is deliberately out of scope here.
 
 ### Durability boundary
 

@@ -615,6 +615,12 @@ fn authorization_revocation_blocks_all_lease_verbs() {
     );
 }
 
+/// In-crate defence in depth for the canonical-event check in `validate_lease`.
+///
+/// External callers cannot reach this at all — [`Lease`] fields are private, so
+/// there is no public path that mutates a granted lease. This asserts the store
+/// still refuses a lease whose event has drifted from the canonical record, so an
+/// in-crate mistake cannot quietly become an authorization bypass.
 #[test]
 fn lease_event_cannot_be_forged_to_change_its_topic() {
     let (store, _) = fixture();
@@ -683,12 +689,13 @@ fn probe(store: &MemoryStore) -> ClaimOutcome {
 }
 
 #[test]
-fn contention_names_the_current_holder_fence_and_expiry() {
+fn contention_names_the_current_holder_and_expiry_but_never_the_fence() {
     let store = contention_fixture("contended");
+    // The holder's active fence is Fence(1) here and is deliberately absent from
+    // the outcome: it is the field that made the disclosure forgeable.
     let held = ClaimOutcome::Contended {
         event_id: EventId("a".into()),
         holder: ConsumerId("holder".into()),
-        fence: Fence(1),
         expires_at: 1000,
     };
     assert_eq!(probe(&store), held);
@@ -727,7 +734,6 @@ fn contention_names_the_lowest_sequence_holder() {
         ClaimOutcome::Contended {
             event_id: EventId("a".into()),
             holder: ConsumerId("holder-a".into()),
-            fence: Fence(1),
             expires_at: 1000,
         }
     );

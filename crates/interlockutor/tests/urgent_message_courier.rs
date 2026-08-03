@@ -21,16 +21,55 @@
 //! so there is no window in which a courier has claimed acceptance without
 //! having recorded it. A partial write can only ever exist in `tmp/`, which is
 //! never read as an effect, so a torn record cannot wedge redelivery.
+//!
+//! # Failure semantics, per step
+//!
+//! The happy path above was specified first and its failure behaviour was left
+//! implied. Three defects came out of that gap. The protocol's per-step failure
+//! semantics are therefore stated here rather than inferred, including the cells
+//! that are argued rather than tested.
+//!
+//! | step | on-disk state if it fails | what a retry observes | terminal state | covered by |
+//! |---|---|---|---|---|
+//! | 1. `create_new` staging | nothing: the name is either unused or already taken by a live attempt | `effects/` unchanged | attempt fails with `Io`; nothing is accepted | argued, not injected — see *Untested cells* |
+//! | 2. write record | partial bytes under `tmp/` only; removed on the error path, and any leak is reaped by age | `effects/` unchanged; torn bytes are never readable as an effect | correct: redelivery re-stages and links | `interrupted_record_does_not_wedge_redelivery` |
+//! | 3. `sync_all` file | staging file with unflushed bytes; removed on the error path | identical to step 2 — the debris shape is the same | correct | debris shape covered by the step-2 test; the fsync error itself is argued |
+//! | 4. `hard_link` | `AlreadyExists` means another attempt's entry is present; any other error leaves no entry | `AlreadyExists` → durability repair, then full-receipt validation | correct | `simultaneous_couriers_record_the_effect_exactly_once`, `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
+//! | 5. `sync_all` `effects/` | **entry is visible but may not be crash-durable**, and `commit` returns `Err` | `AlreadyExists`; the retry re-fsyncs `effects/` *before* validating, and propagates a repeated failure | correct — previously a courier could ACK a non-durable entry | `post_link_directory_sync_failure_is_repaired_before_existing_is_returned` |
+//! | scavenge | a **live** staging name can be removed when an attempt outlives `stale_after` | that attempt's `hard_link` fails with `NotFound` | attempt fails loudly; `effects/` is never wrong and never duplicated | `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` |
+//! | `Existing` validation | — | a record at the right path is only acceptance if it equals the expected receipt in full | mismatch is `UnusableRecord`, never `Existing`, never repaired in place | `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
+//!
+//! ## Untested cells, stated rather than smoothed over
+//!
+//! - **Step 1 and step 3 failures are argued, not injected.** Both are `io`
+//!   failures with no distinguishing on-disk residue: step 1 leaves nothing, and
+//!   step 3 leaves exactly the debris shape step 2 already produces and that the
+//!   torn-write test already covers. Injecting them would exercise the same two
+//!   recovery paths again, so they are reasoned about here instead.
+//! - **Crash durability is not demonstrated.** No in-process test can pull
+//!   power. The fsync steps are implemented to the standard commit protocol and
+//!   argued; nothing here proves them.
+//! - **The scavenger's reap window is a heuristic, not a proof of abandonment.**
+//!   See [`EffectStore::scavenge`].
+//!
+//! # Scavenging: age is a heuristic
+//!
+//! An earlier version of this adapter claimed a concurrent courier's staging file
+//! was "never" deleted. That was untrue. Age does not establish abandonment: an
+//! attempt that pauses longer than `stale_after` between staging and linking can
+//! have its live staging name removed by a concurrent reaper. The claim is now
+//! narrowed to match the mechanism, and zero-age reaping is confined to an
+//! explicitly exclusive entry point. See [`EffectStore::scavenge`].
 
 use interlockutor::{
     AllowAll, AppendOutcome, ClaimOutcome, Clock, ConsumerId, Error, Event, EventId, EventStore,
-    IdempotencyKey, Lease, MemoryStore, NewEvent, Payload, Topic,
+    EventStoreExt, IdempotencyKey, Lease, MemoryStore, NewEvent, Payload, Topic,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
@@ -42,28 +81,18 @@ static STAGING_ID: AtomicU64 = AtomicU64::new(0);
 /// Conservative default: only debris no in-flight attempt can still own.
 const DEFAULT_STALE_AFTER: Duration = Duration::from_secs(3600);
 
+/// Floor on the reap window for any store that may be used concurrently.
+///
+/// Age is the only evidence this adapter has, so the window has to be longer
+/// than the longest plausible attempt. Below this floor the heuristic stops
+/// approximating abandonment at all, so [`EffectStore::open_with`] refuses it
+/// rather than letting a caller opt into reaping live work by accident.
+const MIN_CONCURRENT_STALE_AFTER: Duration = Duration::from_secs(60);
+
 /// Filenames must fit the common single-component limit of 255 bytes.
 const MAX_NAME_BYTES: usize = 255;
 
 const TOPIC: &str = "urgent-messages";
-
-/// Flushes a directory's entries to stable storage.
-///
-/// On unix this is a real `fsync` of the directory. Without it, a hard link is
-/// atomically *visible* but not crash-durable: the new entry can still vanish
-/// on power loss. There is no portable equivalent of this call, so on every
-/// other platform it is a deliberate no-op, and the crash-durability half of
-/// the recipient contract does not hold there. Atomicity and visibility still
-/// do, because those come from `hard_link` itself.
-#[cfg(unix)]
-fn sync_dir(path: &Path) -> io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-#[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> io::Result<()> {
-    Ok(())
-}
 
 #[derive(Default)]
 struct ManualClock(AtomicU64);
@@ -100,7 +129,7 @@ enum AcceptError {
         encoded: usize,
     },
     /// A record exists at the target path but is unreadable, truncated, empty,
-    /// or names a different event.
+    /// or is not the receipt this event should have produced.
     ///
     /// This is explicitly **not** a prior acceptance. The recipient cannot know
     /// whether the effect behind an unreadable record was performed, so it
@@ -108,11 +137,35 @@ enum AcceptError {
     /// queue item. Reporting this as `Existing` would convert media corruption
     /// into silent effect loss; repairing it in place would convert it into
     /// silent effect duplication.
+    ///
+    /// `source` keeps the underlying parse or I/O failure attached rather than
+    /// flattening it into `reason`, so callers can still walk the error chain.
     UnusableRecord {
         path: PathBuf,
         reason: String,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    },
+    /// A reap window short enough to delete live staging files was requested for
+    /// a store that may be used concurrently.
+    ScavengeWindowTooShort {
+        requested: Duration,
+        minimum: Duration,
     },
     Io(io::Error),
+}
+
+impl AcceptError {
+    fn unusable(
+        path: &Path,
+        reason: String,
+        source: Option<Box<dyn StdError + Send + Sync + 'static>>,
+    ) -> Self {
+        Self::UnusableRecord {
+            path: path.to_path_buf(),
+            reason,
+            source,
+        }
+    }
 }
 
 impl fmt::Display for AcceptError {
@@ -122,19 +175,33 @@ impl fmt::Display for AcceptError {
                 f,
                 "encoded event ID is {encoded} bytes, over the {MAX_NAME_BYTES}-byte name limit"
             ),
-            Self::UnusableRecord { path, reason } => {
+            Self::UnusableRecord { path, reason, .. } => {
                 write!(
                     f,
                     "existing record at {} is unusable: {reason}",
                     path.display()
                 )
             }
+            Self::ScavengeWindowTooShort { requested, minimum } => write!(
+                f,
+                "scavenge window {requested:?} is below the {minimum:?} floor for concurrent use"
+            ),
             Self::Io(error) => write!(f, "recipient I/O failed: {error}"),
         }
     }
 }
 
-impl StdError for AcceptError {}
+impl StdError for AcceptError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::UnusableRecord { source, .. } => source
+                .as_ref()
+                .map(|error| &**error as &(dyn StdError + 'static)),
+            Self::EventIdTooLong { .. } | Self::ScavengeWindowTooShort { .. } => None,
+        }
+    }
+}
 
 impl From<io::Error> for AcceptError {
     fn from(error: io::Error) -> Self {
@@ -153,8 +220,9 @@ impl From<io::Error> for AcceptError {
 /// injective and its charset contains no separator, so distinct ids always map
 /// to distinct names inside `effects/` and no id can escape it. Being injective
 /// rather than a digest, it also cannot collide — but the original id is still
-/// stored in the record body and re-verified on every `Existing` path, so an
-/// encoding accident could not silently read as acceptance of a different event.
+/// stored in the record body, and the whole record is re-verified on every
+/// `Existing` path, so an encoding accident could not silently read as
+/// acceptance of a different event.
 fn encode_event_id(id: &EventId) -> Result<String, AcceptError> {
     let mut encoded = String::with_capacity(id.0.len() * 2 + 1);
     encoded.push('e');
@@ -177,6 +245,17 @@ fn acceptance_receipt(event: &Event) -> AcceptanceReceipt {
     }
 }
 
+/// Injectable failures, so recovery paths can be exercised rather than argued.
+///
+/// Held per store rather than in a global, so one store's injected fault cannot
+/// leak into another test whether the harness isolates by process or by thread.
+/// A store reopened from the same root models a fresh process and starts clean,
+/// which is what makes "retry after a failed step" expressible.
+#[derive(Default)]
+struct Faults {
+    dir_syncs_to_fail: AtomicU64,
+}
+
 /// Test recipient whose effect records outlive any one courier attempt.
 ///
 /// Reconstructing this adapter from the same root models a fresh courier
@@ -184,6 +263,7 @@ fn acceptance_receipt(event: &Event) -> AcceptanceReceipt {
 /// [`MemoryStore`] durable.
 struct EffectStore {
     root: PathBuf,
+    faults: Faults,
 }
 
 /// Result of the atomic link step, before the record is validated.
@@ -193,21 +273,84 @@ enum Commit {
 }
 
 impl EffectStore {
-    /// Opens the store, creating its layout and scavenging crashed staging files.
+    /// Opens the store with the conservative default reap window.
     fn open(root: &Path) -> Result<Self, AcceptError> {
         Self::open_with(root, DEFAULT_STALE_AFTER)
     }
 
+    /// Opens a store that may be used concurrently with other attempts.
+    ///
+    /// Refuses a reap window below [`MIN_CONCURRENT_STALE_AFTER`]: see
+    /// [`EffectStore::scavenge`] for why a short window is not a safe knob.
     fn open_with(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
+        if stale_after < MIN_CONCURRENT_STALE_AFTER {
+            return Err(AcceptError::ScavengeWindowTooShort {
+                requested: stale_after,
+                minimum: MIN_CONCURRENT_STALE_AFTER,
+            });
+        }
+        Self::open_unchecked(root, stale_after)
+    }
+
+    /// Opens a store for recovery, with **no** floor on the reap window.
+    ///
+    /// The caller asserts that no other attempt is in flight against this root.
+    /// That assertion is what licenses reaping by age at all — it replaces the
+    /// heuristic with an actual exclusivity guarantee supplied from outside.
+    /// Nothing in this adapter checks it, so it is a named, deliberate handoff
+    /// rather than a silent assumption.
+    fn open_exclusive(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
+        Self::open_unchecked(root, stale_after)
+    }
+
+    fn open_unchecked(root: &Path, stale_after: Duration) -> Result<Self, AcceptError> {
         let store = Self {
             root: root.to_path_buf(),
+            faults: Faults::default(),
         };
         fs::create_dir_all(store.effects_dir())?;
         fs::create_dir_all(store.staging_dir())?;
         fs::create_dir_all(store.duplicates_dir())?;
-        sync_dir(&store.root)?;
+        store.sync_dir(&store.root)?;
         store.scavenge(stale_after)?;
         Ok(store)
+    }
+
+    /// Makes the next `n` directory syncs on this store fail.
+    fn fail_next_dir_syncs(&self, n: u64) {
+        self.faults.dir_syncs_to_fail.store(n, Ordering::SeqCst);
+    }
+
+    /// Flushes a directory's entries to stable storage.
+    ///
+    /// On unix this is a real `fsync` of the directory. Without it, a hard link
+    /// is atomically *visible* but not crash-durable: the new entry can still
+    /// vanish on power loss. There is no portable equivalent of this call, so on
+    /// every other platform it is a deliberate no-op, and the crash-durability
+    /// half of the recipient contract does not hold there. Atomicity and
+    /// visibility still do, because those come from `hard_link` itself.
+    fn sync_dir(&self, path: &Path) -> io::Result<()> {
+        if self
+            .faults
+            .dir_syncs_to_fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::other("injected directory sync failure"));
+        }
+        Self::sync_dir_uninjected(path)
+    }
+
+    #[cfg(unix)]
+    fn sync_dir_uninjected(path: &Path) -> io::Result<()> {
+        File::open(path)?.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync_dir_uninjected(_path: &Path) -> io::Result<()> {
+        Ok(())
     }
 
     fn effects_dir(&self) -> PathBuf {
@@ -222,18 +365,39 @@ impl EffectStore {
         self.root.join("duplicates")
     }
 
+    /// Shared append log used only by the racy negative control.
+    fn naive_log(&self) -> PathBuf {
+        self.root.join("naive-log")
+    }
+
     fn record_path(&self, id: &EventId) -> Result<PathBuf, AcceptError> {
         Ok(self.effects_dir().join(encode_event_id(id)?))
     }
 
-    /// Removes staging files that no in-flight attempt can still own.
+    /// Removes staging files that are *probably* abandoned.
     ///
     /// A staging file is only ever linked into `effects/` after its own fsync,
     /// so anything left in `tmp/` is either an attempt in progress or debris
-    /// from a crashed one. Age discriminates: entries untouched for at least
-    /// `stale_after` are removed, so a concurrent courier's staging file is
-    /// never deleted out from under it. Without this, crashed attempts would
-    /// accumulate in `tmp/` forever.
+    /// from a crashed one. This adapter cannot tell those apart: it has no
+    /// liveness marker, no advisory lock, and no ownership claim on the name.
+    ///
+    /// **Age is a heuristic, not proof of abandonment.** Entries untouched for
+    /// at least `stale_after` are removed. That is only approximately correct,
+    /// and it rests on a stated assumption: *no single accept attempt holds a
+    /// staging file for longer than `stale_after` between creating it and
+    /// linking it.* An attempt that violates the assumption can have its live
+    /// staging name reaped, after which its `hard_link` fails with `NotFound`.
+    ///
+    /// The failure is conservative, not corrupting: the attempt fails loudly and
+    /// records nothing, so the outcome is an avoidable retry, never a duplicated
+    /// or lost effect. [`EffectStore::open_with`] enforces a floor on the window
+    /// so the assumption is at least plausible; [`EffectStore::open_exclusive`]
+    /// is the named escape hatch for recovery-time reaping, where the caller
+    /// supplies exclusivity instead.
+    ///
+    /// Making this exact rather than heuristic needs real ownership evidence —
+    /// an advisory lock, a liveness marker, or linking from an open descriptor
+    /// so the pathname stops mattering. That is deliberately not done here.
     fn scavenge(&self, stale_after: Duration) -> Result<usize, AcceptError> {
         let mut removed = 0;
         for entry in fs::read_dir(self.staging_dir())? {
@@ -262,26 +426,40 @@ impl EffectStore {
         match self.commit(&target, &receipt)? {
             Commit::Linked => Ok(AcceptanceOutcome::Recorded(receipt)),
             Commit::AlreadyExists => {
+                let parent = target.parent().expect("record path has a parent directory");
+                // Durability repair, before anything is called acceptance. A
+                // previous attempt can have linked the entry and then failed its
+                // directory fsync: it returned an error, but left the entry
+                // visible. Without re-syncing here, this path would report a
+                // prior acceptance for an entry that was never made crash-
+                // durable, and the courier would ACK work that can still vanish.
+                self.sync_dir(parent)?;
+
                 // The filename alone is not a durable receipt: a path can exist
-                // with a truncated, empty, or corrupt body. Read it, parse it,
-                // and confirm it names this event before calling it acceptance.
+                // with a truncated, empty, corrupt, or substituted body. Read it
+                // and require it to equal the receipt this event deterministically
+                // produces — the whole record, not just its key. Matching only
+                // the event id accepted any record filed under the right name,
+                // including one carrying somebody else's receipt.
                 let existing = self.read_record(&target)?;
-                if existing.event_id != event.id.0 {
-                    return Err(AcceptError::UnusableRecord {
-                        path: target,
-                        reason: format!(
-                            "record names event {:?}, not {:?}",
-                            existing.event_id, event.id.0
-                        ),
-                    });
+                if existing != receipt {
+                    return Err(AcceptError::unusable(
+                        &target,
+                        format!("record {existing:?} is not the expected receipt {receipt:?}"),
+                        None,
+                    ));
                 }
                 Ok(AcceptanceOutcome::Existing(existing))
             }
         }
     }
 
-    /// Negative control: the identical commit protocol with the [`EventId`]
+    /// Negative control A: the identical commit protocol with the [`EventId`]
     /// keying removed, so every attempt lands under a fresh name.
+    ///
+    /// This isolates the **keying**, and nothing else. It is sequential by
+    /// construction and is *not* a race control — see
+    /// [`EffectStore::naive_observe`] for that.
     fn accept_without_dedup(&self, event: &Event) -> Result<AcceptanceReceipt, AcceptError> {
         let receipt = acceptance_receipt(event);
         let target = self
@@ -289,15 +467,87 @@ impl EffectStore {
             .join(format!("d{}", STAGING_ID.fetch_add(1, Ordering::Relaxed)));
         match self.commit(&target, &receipt)? {
             Commit::Linked => Ok(receipt),
-            Commit::AlreadyExists => Err(AcceptError::UnusableRecord {
-                path: target,
-                reason: "unkeyed duplicate name was reused".into(),
-            }),
+            Commit::AlreadyExists => Err(AcceptError::unusable(
+                &target,
+                "unkeyed duplicate name was reused".into(),
+                None,
+            )),
         }
     }
 
-    /// The five-step commit. `target`'s parent directory must already exist.
-    fn commit(&self, target: &Path, receipt: &AcceptanceReceipt) -> Result<Commit, AcceptError> {
+    /// Negative control B, half one: observe whether the effect is already
+    /// recorded in a shared append log.
+    ///
+    /// This is the shape the real protocol exists to avoid — the dedup decision
+    /// and the effect record are two operations, so an interleaving exists in
+    /// which both couriers observe absence. Exposing the halves separately lets
+    /// a test *force* that interleaving deterministically instead of sampling
+    /// for it under a barrier and hoping it shows up.
+    fn naive_observe(&self, event: &Event) -> Result<bool, AcceptError> {
+        let log = self.naive_log();
+        if !log.exists() {
+            return Ok(false);
+        }
+        for line in io::BufReader::new(File::open(&log)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let record: AcceptanceReceipt = serde_json::from_str(&line).map_err(|error| {
+                AcceptError::unusable(
+                    &log,
+                    format!("bad log line: {error}"),
+                    Some(Box::new(error)),
+                )
+            })?;
+            if record.event_id == event.id.0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Negative control B, half two: append the effect record to the shared log.
+    fn naive_record(&self, event: &Event) -> Result<AcceptanceReceipt, AcceptError> {
+        let receipt = acceptance_receipt(event);
+        let mut bytes = serde_json::to_vec(&receipt).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.naive_log())?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        Ok(receipt)
+    }
+
+    fn naive_log_records(&self) -> Result<Vec<AcceptanceReceipt>, AcceptError> {
+        let log = self.naive_log();
+        if !log.exists() {
+            return Ok(Vec::new());
+        }
+        let mut records = Vec::new();
+        for line in io::BufReader::new(File::open(&log)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            records.push(serde_json::from_str(&line).map_err(|error| {
+                AcceptError::unusable(
+                    &log,
+                    format!("bad log line: {error}"),
+                    Some(Box::new(error)),
+                )
+            })?);
+        }
+        Ok(records)
+    }
+
+    /// Steps 1 to 3: a unique, fully written, fsynced staging file.
+    ///
+    /// Returned as a path rather than consumed immediately so tests can hold a
+    /// *live* stage across another operation.
+    fn stage(&self, receipt: &AcceptanceReceipt) -> Result<PathBuf, AcceptError> {
         // 1. unique staging file on the same filesystem, via create_new
         let staging = self.staging_dir().join(format!(
             "s{}-{}",
@@ -322,33 +572,51 @@ impl EffectStore {
             let _ = fs::remove_file(&staging);
             return Err(AcceptError::Io(error));
         }
+        Ok(staging)
+    }
 
+    /// Steps 4 and 5: publish the staged record, then make the entry durable.
+    ///
+    /// Always removes the staging file, on every outcome, so crashed attempts
+    /// are the only thing scavenging ever has to handle.
+    fn link_staged(&self, staging: &Path, target: &Path) -> Result<Commit, AcceptError> {
         // 4. atomically link into place; fails if the target already exists
-        let linked = fs::hard_link(&staging, target);
+        let linked = fs::hard_link(staging, target);
         let parent = target.parent().expect("record path has a parent directory");
         let result = match linked {
             // 5. sync the DIRECTORY so the new entry survives a crash, before
             //    the staging copy that could have replaced it goes away.
-            Ok(()) => sync_dir(parent)
+            //
+            //    If this fails the entry is already visible. `accept` repairs
+            //    that on the next attempt's `AlreadyExists` path; the error is
+            //    still propagated here, so this attempt never reports success.
+            Ok(()) => self
+                .sync_dir(parent)
                 .map(|()| Commit::Linked)
                 .map_err(Into::into),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Commit::AlreadyExists),
             Err(error) => Err(AcceptError::Io(error)),
         };
-        // Clean up staging on every outcome, so crashed attempts are the only
-        // thing scavenging ever has to handle.
-        let _ = fs::remove_file(&staging);
+        let _ = fs::remove_file(staging);
         result
     }
 
+    /// The five-step commit. `target`'s parent directory must already exist.
+    fn commit(&self, target: &Path, receipt: &AcceptanceReceipt) -> Result<Commit, AcceptError> {
+        let staging = self.stage(receipt)?;
+        self.link_staged(&staging, target)
+    }
+
     fn read_record(&self, path: &Path) -> Result<AcceptanceReceipt, AcceptError> {
-        let bytes = fs::read(path).map_err(|error| AcceptError::UnusableRecord {
-            path: path.to_path_buf(),
-            reason: format!("unreadable: {error}"),
+        let bytes = fs::read(path).map_err(|error| {
+            AcceptError::unusable(path, format!("unreadable: {error}"), Some(Box::new(error)))
         })?;
-        serde_json::from_slice(&bytes).map_err(|error| AcceptError::UnusableRecord {
-            path: path.to_path_buf(),
-            reason: format!("not a complete record: {error}"),
+        serde_json::from_slice(&bytes).map_err(|error| {
+            AcceptError::unusable(
+                path,
+                format!("not a complete record: {error}"),
+                Some(Box::new(error)),
+            )
         })
     }
 
@@ -488,10 +756,11 @@ fn urgent_message_has_one_live_courier_and_once_only_recipient_acceptance()
         .collect::<Vec<_>>();
     assert_eq!(first_lease.len(), 1, "exactly one courier holds the lease");
     let first_lease = first_lease.into_iter().next().expect("checked above");
-    assert_eq!(first_lease.event, appended);
+    assert_eq!(*first_lease.event(), appended);
 
-    // The loser is told who holds the message, under which fence, and when that
-    // hold lapses — enough to schedule a retry instead of spinning blindly.
+    // The loser is told who holds the message and when that hold lapses — enough
+    // to schedule a retry instead of spinning blindly. It is *not* told the
+    // holder's fence, which was the last field needed to forge the hold.
     let denied: Vec<_> = outcomes
         .iter()
         .filter(|outcome| !matches!(outcome, ClaimOutcome::Granted(_)))
@@ -501,15 +770,14 @@ fn urgent_message_has_one_live_courier_and_once_only_recipient_acceptance()
         denied[0],
         &ClaimOutcome::Contended {
             event_id: appended.id.clone(),
-            holder: first_lease.owner.clone(),
-            fence: first_lease.fence,
-            expires_at: first_lease.expires_at,
+            holder: first_lease.owner().clone(),
+            expires_at: first_lease.expires_at(),
         }
     );
 
     let scratch = ScratchRoot::create()?;
     let first_recipient = EffectStore::open(scratch.path())?;
-    let first_receipt = match first_recipient.accept(&first_lease.event)? {
+    let first_receipt = match first_recipient.accept(first_lease.event())? {
         AcceptanceOutcome::Recorded(receipt) => receipt,
         AcceptanceOutcome::Existing(_) => return Err("first acceptance was not new".into()),
     };
@@ -518,15 +786,15 @@ fn urgent_message_has_one_live_courier_and_once_only_recipient_acceptance()
 
     // The courier loses the queue ACK after the recipient has durably accepted
     // the message. Expiry therefore causes an intentional at-least-once retry.
-    let second_lease = claim_after_expiry(&store, &clock, &first_lease.owner);
-    assert_eq!(second_lease.event, appended);
-    assert!(second_lease.fence > first_lease.fence);
+    let second_lease = claim_after_expiry(&store, &clock, first_lease.owner());
+    assert_eq!(*second_lease.event(), appended);
+    assert!(second_lease.fence() > first_lease.fence());
     assert_eq!(store.ack_work(&first_lease), Err(Error::StaleFence));
 
     // A fresh recipient process, reading the same root.
     let redelivery_recipient = EffectStore::open(scratch.path())?;
     assert_eq!(
-        redelivery_recipient.accept(&second_lease.event)?,
+        redelivery_recipient.accept(second_lease.event())?,
         AcceptanceOutcome::Existing(first_receipt.clone())
     );
     assert_eq!(redelivery_recipient.receipts()?, vec![first_receipt]);
@@ -534,7 +802,7 @@ fn urgent_message_has_one_live_courier_and_once_only_recipient_acceptance()
 
     let queue_ack = store.ack_work(&second_lease)?;
     assert_eq!(queue_ack.event_id, appended.id);
-    assert_eq!(queue_ack.fence, second_lease.fence);
+    assert_eq!(queue_ack.fence, second_lease.fence());
 
     // Acknowledged work is terminal: no grant, and no holder disclosed either.
     assert_eq!(
@@ -561,8 +829,7 @@ fn urgent_message_has_one_live_courier_and_once_only_recipient_acceptance()
 /// Both observe the message as undelivered at the same instant. The link step
 /// is the dedup decision *and* the effect record, so exactly one can win
 /// regardless of interleaving. The round is repeated on a fresh root each time
-/// because one barrier release only samples one interleaving; a check-then-append
-/// recipient duplicates on some fraction of these rounds rather than on all.
+/// because one barrier release only samples one interleaving.
 #[cfg(unix)]
 #[test]
 fn simultaneous_couriers_record_the_effect_exactly_once() -> Result<(), Box<dyn StdError>> {
@@ -583,8 +850,8 @@ fn simultaneous_couriers_record_the_effect_exactly_once() -> Result<(), Box<dyn 
                 Duration::from_millis(10),
             )?
             .expect("urgent message should be claimable");
-        let fresh_lease = claim_after_expiry(&store, &clock, &stale_lease.owner);
-        assert!(fresh_lease.fence > stale_lease.fence);
+        let fresh_lease = claim_after_expiry(&store, &clock, stale_lease.owner());
+        assert!(fresh_lease.fence() > stale_lease.fence());
         assert_eq!(store.ack_work(&stale_lease), Err(Error::StaleFence));
 
         let scratch = ScratchRoot::create()?;
@@ -597,7 +864,7 @@ fn simultaneous_couriers_record_the_effect_exactly_once() -> Result<(), Box<dyn 
                 let barrier = barrier.clone();
                 std::thread::spawn(move || {
                     barrier.wait();
-                    recipient.accept(&lease.event)
+                    recipient.accept(lease.event())
                 })
             })
             .collect();
@@ -658,12 +925,15 @@ fn interrupted_record_does_not_wedge_redelivery() -> Result<(), Box<dyn StdError
     assert_eq!(crashed.receipts()?, vec![]);
 
     // A fresh recipient process scavenges the debris and proceeds normally.
-    let reopened = EffectStore::open_with(scratch.path(), Duration::ZERO)?;
+    // Zero-age reaping is only available through the exclusive entry point,
+    // where the caller asserts no other attempt is in flight — which is exactly
+    // the situation being modelled here.
+    let reopened = EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?;
     assert!(!torn.exists(), "stale staging file should be scavenged");
     assert!(!empty.exists(), "stale staging file should be scavenged");
     assert_eq!(reopened.staging_entries()?, 0);
 
-    let receipt = match reopened.accept(&lease.event)? {
+    let receipt = match reopened.accept(lease.event())? {
         AcceptanceOutcome::Recorded(receipt) => receipt,
         AcceptanceOutcome::Existing(_) => {
             return Err("torn debris was misread as a prior acceptance".into());
@@ -672,14 +942,183 @@ fn interrupted_record_does_not_wedge_redelivery() -> Result<(), Box<dyn StdError
     assert_eq!(receipt, acceptance_receipt(&appended));
 
     // Redelivery after the interruption still yields the same receipt.
-    let second_lease = claim_after_expiry(&store, &clock, &lease.owner);
+    let second_lease = claim_after_expiry(&store, &clock, lease.owner());
     let redelivery = EffectStore::open(scratch.path())?;
     assert_eq!(
-        redelivery.accept(&second_lease.event)?,
+        redelivery.accept(second_lease.event())?,
         AcceptanceOutcome::Existing(receipt.clone())
     );
     assert_eq!(redelivery.receipts()?, vec![receipt]);
     store.ack_work(&second_lease)?;
+    Ok(())
+}
+
+/// A concurrently-usable store refuses a reap window that could delete live work.
+#[test]
+fn short_reap_windows_are_refused_outside_exclusive_recovery() -> Result<(), Box<dyn StdError>> {
+    let scratch = ScratchRoot::create()?;
+    let error = EffectStore::open_with(scratch.path(), Duration::ZERO)
+        .err()
+        .ok_or("a zero reap window must be refused for concurrent use")?;
+    assert!(
+        matches!(error, AcceptError::ScavengeWindowTooShort { .. }),
+        "unexpected error {error:?}"
+    );
+    // The same window is available, named as such, for exclusive recovery.
+    EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?;
+    Ok(())
+}
+
+/// A live stage really can be reaped, and the attempt fails rather than lying.
+///
+/// This is the test the old "a concurrent courier's staging file is never
+/// deleted" claim did not have: the previous coverage only reaped simulated
+/// debris. Both directions are asserted — the reap happens and the attempt
+/// fails loudly under a zero window, and a live stage survives a window above
+/// the enforced floor.
+#[cfg(unix)]
+#[test]
+fn live_staging_file_may_be_reaped_and_the_attempt_fails_loudly() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let receipt = acceptance_receipt(&appended);
+
+    // Deterministic direction: a live stage, then a zero-window reap, then link.
+    {
+        let scratch = ScratchRoot::create()?;
+        let recipient = EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?;
+        let staging = recipient.stage(&receipt)?;
+        assert!(staging.exists(), "the stage is live and unlinked");
+
+        assert_eq!(
+            recipient.scavenge(Duration::ZERO)?,
+            1,
+            "age alone cannot tell a live stage from debris"
+        );
+        assert!(!staging.exists(), "the live stage was reaped");
+
+        let target = recipient.record_path(&appended.id)?;
+        let error = recipient
+            .link_staged(&staging, &target)
+            .err()
+            .ok_or("linking a reaped stage must fail")?;
+        assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
+        assert!(
+            StdError::source(&error).is_some(),
+            "the underlying I/O error must stay attached"
+        );
+        // Conservative, not corrupting: nothing was recorded, nothing was lost.
+        assert_eq!(recipient.receipts()?, vec![]);
+        assert!(!target.exists());
+    }
+
+    // Concurrent direction: a scavenger races a live stage. Whatever the
+    // interleaving, effects/ ends up holding either nothing or exactly the
+    // right record — never a wrong one and never two.
+    {
+        let scratch = ScratchRoot::create()?;
+        let recipient = Arc::new(EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?);
+        let staging = recipient.stage(&receipt)?;
+        let target = recipient.record_path(&appended.id)?;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let reaper = {
+            let recipient = recipient.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                recipient.scavenge(Duration::ZERO)
+            })
+        };
+        barrier.wait();
+        let linked = recipient.link_staged(&staging, &target);
+        reaper.join().expect("reaper thread should not panic")?;
+
+        match linked {
+            Ok(Commit::Linked) => assert_eq!(recipient.receipts()?, vec![receipt.clone()]),
+            Ok(Commit::AlreadyExists) => return Err("nothing else could have linked".into()),
+            Err(AcceptError::Io(_)) => assert_eq!(recipient.receipts()?, vec![]),
+            Err(other) => return Err(format!("unexpected failure {other:?}").into()),
+        }
+        assert!(recipient.receipts()?.len() <= 1);
+    }
+
+    // A window above the floor leaves a fresh live stage alone.
+    {
+        let scratch = ScratchRoot::create()?;
+        let recipient = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
+        let staging = recipient.stage(&receipt)?;
+        assert_eq!(recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?, 0);
+        assert!(staging.exists(), "a fresh stage is not stale");
+        let target = recipient.record_path(&appended.id)?;
+        assert!(matches!(
+            recipient.link_staged(&staging, &target)?,
+            Commit::Linked
+        ));
+        assert_eq!(recipient.receipts()?, vec![receipt]);
+    }
+    Ok(())
+}
+
+/// A link that outlived its directory fsync is repaired before it counts.
+///
+/// The failure being injected is step 5: `hard_link` succeeds, the `effects/`
+/// fsync fails. The entry is visible but not crash-durable, and `commit`
+/// correctly reports an error. The defect was that the *retry* then read the
+/// visible entry, answered `Existing`, and never re-synced — so a courier could
+/// acknowledge the queue item over an entry that could still vanish on power
+/// loss. The retry now fsyncs before it validates anything.
+#[cfg(unix)]
+#[test]
+fn post_link_directory_sync_failure_is_repaired_before_existing_is_returned()
+-> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let scratch = ScratchRoot::create()?;
+
+    // Attempt one: the link lands, the directory sync fails, and the attempt
+    // reports failure. The courier must not acknowledge on this path.
+    let first = EffectStore::open(scratch.path())?;
+    first.fail_next_dir_syncs(1);
+    let error = first
+        .accept(&appended)
+        .err()
+        .ok_or("a failed directory sync must not report acceptance")?;
+    assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
+    assert!(
+        StdError::source(&error).is_some(),
+        "the injected I/O error must stay attached as a source"
+    );
+    // The entry is visible even though the attempt failed. That is the gap.
+    assert!(first.record_path(&appended.id)?.exists());
+    assert_eq!(first.staging_entries()?, 0);
+
+    // Attempt two, from a fresh recipient process: it takes the AlreadyExists
+    // path. If its durability repair also fails, it must propagate, not answer
+    // Existing over a possibly non-durable entry.
+    let retry = EffectStore::open(scratch.path())?;
+    retry.fail_next_dir_syncs(1);
+    let error = retry
+        .accept(&appended)
+        .err()
+        .ok_or("a failed durability repair must not report Existing")?;
+    assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
+
+    // Attempt three: the repair succeeds, so the entry is durable and only then
+    // is it reported as a prior acceptance.
+    let repaired = EffectStore::open(scratch.path())?;
+    assert_eq!(
+        repaired.accept(&appended)?,
+        AcceptanceOutcome::Existing(acceptance_receipt(&appended))
+    );
+    assert_eq!(repaired.receipts()?, vec![acceptance_receipt(&appended)]);
+    assert_eq!(repaired.staging_entries()?, 0);
     Ok(())
 }
 
@@ -754,6 +1193,12 @@ fn oversized_event_id_is_refused_rather_than_truncated() -> Result<(), Box<dyn S
 }
 
 /// A damaged record on the `AlreadyExists` path is never reported as acceptance.
+///
+/// The **wrong receipt** case is the one that matters most: it carries the right
+/// event id, so a check that only compared the embedded key accepted it and
+/// returned that record's arbitrary `receipt_id` as a successful prior
+/// acceptance. The check is now full-record equality against the receipt this
+/// event deterministically produces.
 #[test]
 fn corrupt_existing_record_is_not_reported_as_prior_acceptance() -> Result<(), Box<dyn StdError>> {
     let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
@@ -762,12 +1207,18 @@ fn corrupt_existing_record_is_not_reported_as_prior_acceptance() -> Result<(), B
         AppendOutcome::Existing(_) => return Err("first append unexpectedly found an event".into()),
     };
 
-    for (label, damage) in [
-        ("truncated", &br#"{"event_id":"urgent-mes"#[..]),
-        ("empty", &b""[..]),
+    for (label, damage, expect_source) in [
+        ("truncated", &br#"{"event_id":"urgent-mes"#[..], true),
+        ("empty", &b""[..], true),
         (
             "wrong event",
             &br#"{"event_id":"someone-else","receipt_id":"x"}"#[..],
+            false,
+        ),
+        (
+            "right event, substituted receipt",
+            &br#"{"event_id":"urgent-message-2026-08-03-001","receipt_id":"attacker-supplied"}"#[..],
+            false,
         ),
     ] {
         let scratch = ScratchRoot::create()?;
@@ -785,13 +1236,23 @@ fn corrupt_existing_record_is_not_reported_as_prior_acceptance() -> Result<(), B
             matches!(error, AcceptError::UnusableRecord { .. }),
             "{label} record produced {error:?}"
         );
+        // Parse and I/O failures keep their cause; a semantic mismatch has none.
+        assert_eq!(
+            StdError::source(&error).is_some(),
+            expect_source,
+            "{label} record source chain"
+        );
         assert_eq!(recipient.staging_entries()?, 0, "{label} leaked staging");
     }
     Ok(())
 }
 
-/// Negative control: the same commit protocol, minus [`EventId`] keying, really
-/// does record the effect twice. Dedup is doing the work, not the filesystem.
+/// Negative control A: the same commit protocol, minus [`EventId`] keying.
+///
+/// This isolates the keying and nothing else, on a **sequential** redelivery.
+/// It shows that dedup by `EventId` is what collapses a redelivery into one
+/// effect; it does *not* demonstrate anything about racing. The racy shape has
+/// its own control below, and the two claims must not be conflated.
 #[test]
 fn redelivery_duplicates_recipient_effect_without_event_id_dedup() -> Result<(), Box<dyn StdError>>
 {
@@ -808,10 +1269,10 @@ fn redelivery_duplicates_recipient_effect_without_event_id_dedup() -> Result<(),
 
     let scratch = ScratchRoot::create()?;
     let recipient = EffectStore::open(scratch.path())?;
-    recipient.accept_without_dedup(&first_lease.event)?;
+    recipient.accept_without_dedup(first_lease.event())?;
 
-    let second_lease = claim_after_expiry(&store, &clock, &first_lease.owner);
-    recipient.accept_without_dedup(&second_lease.event)?;
+    let second_lease = claim_after_expiry(&store, &clock, first_lease.owner());
+    recipient.accept_without_dedup(second_lease.event())?;
     store.ack_work(&second_lease)?;
 
     let receipts = recipient.duplicate_receipts()?;
@@ -823,5 +1284,78 @@ fn redelivery_duplicates_recipient_effect_without_event_id_dedup() -> Result<(),
     assert_eq!(receipts[0].event_id, receipts[1].event_id);
     // The deduplicated view of the same two attempts holds nothing at all.
     assert_eq!(recipient.receipts()?, vec![]);
+    Ok(())
+}
+
+/// Negative control B: a check-then-append recipient duplicates the effect.
+///
+/// This is the control that discriminates the *atomicity* of the real protocol,
+/// which control A does not. The naive recipient splits the dedup decision from
+/// the effect record, and the interleaving is **forced** rather than sampled:
+/// both couriers observe absence, and only then does either record. A barrier
+/// might or might not produce that ordering on a given run; forcing it means the
+/// control demonstrates the defect every time, on every platform.
+///
+/// The real protocol has no such interleaving to force. `hard_link` *is* the
+/// decision and the record, so the same two attempts are run through `accept`
+/// back to back and exactly one records.
+#[test]
+fn check_then_append_recipient_duplicates_where_the_atomic_link_does_not()
+-> Result<(), Box<dyn StdError>> {
+    let clock = Arc::new(ManualClock::default());
+    let store = MemoryStore::with_clock(clock.clone(), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let stale_lease = store
+        .claim(
+            &ConsumerId("courier-a".into()),
+            &Topic(TOPIC.into()),
+            Duration::from_millis(10),
+        )?
+        .expect("urgent message should be claimable");
+    let fresh_lease = claim_after_expiry(&store, &clock, stale_lease.owner());
+
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open(scratch.path())?;
+
+    // Forced losing interleaving: observe, observe, record, record.
+    assert!(!recipient.naive_observe(stale_lease.event())?);
+    assert!(!recipient.naive_observe(fresh_lease.event())?);
+    recipient.naive_record(stale_lease.event())?;
+    recipient.naive_record(fresh_lease.event())?;
+
+    let log = recipient.naive_log_records()?;
+    assert_eq!(
+        log.len(),
+        2,
+        "check-then-append records the effect twice under the forced interleaving"
+    );
+    assert_eq!(log[0], log[1]);
+    assert_eq!(log[0], acceptance_receipt(&appended));
+
+    // The same two attempts through the atomic protocol: one record, one
+    // observation of it, one file on disk.
+    let outcomes = [
+        recipient.accept(stale_lease.event())?,
+        recipient.accept(fresh_lease.event())?,
+    ];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcceptanceOutcome::Recorded(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, AcceptanceOutcome::Existing(_)))
+            .count(),
+        1
+    );
+    assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
+    store.ack_work(&fresh_lease)?;
     Ok(())
 }

@@ -213,6 +213,23 @@ pub(super) fn classify_replay<Id: Eq, Topic: Eq, Payload: Eq>(
     }
 }
 
+/// # The premise these proofs rest on
+///
+/// Every harness below reasons about a *supplied* `(owner, fence)` pair against
+/// kernel state. They prove that a stale or wrong-owner token cannot mutate, and
+/// that remains true. They say nothing about **where a valid token comes from**.
+///
+/// That unstated premise — that only the rightful holder can produce a valid
+/// token — is what a holder-and-fence disclosure broke: an attacker presenting a
+/// *correct* owner and fence, synthesized from data the API published, satisfies
+/// every check here by construction. No kernel-level proof could have caught it.
+///
+/// The premise is now discharged outside this file, by the type system:
+/// [`crate::Lease`] is unconstructable outside the crate and
+/// [`crate::ClaimOutcome::Contended`] no longer discloses the fence. That is a
+/// compile-time property, so it is covered by `compile_fail` doctests rather
+/// than by a harness. State it here so nobody reads "the kernel is proven" as
+/// "token provenance is proven".
 #[cfg(kani)]
 mod proofs {
     use super::*;

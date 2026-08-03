@@ -152,17 +152,104 @@ pub struct BroadcastAck {
 pub struct Fence(pub u64);
 
 /// A temporary, renewable right to execute a work item.
+///
+/// # Unforgeable outside this crate
+///
+/// Every field is private and there is no public constructor, no `Default`, no
+/// `Deserialize`, and no `From` impl that rebuilds one from parts. The only ways
+/// to obtain a `Lease` are to win [`EventStore::claim_detailed`] (or its lossy
+/// [`EventStoreExt::claim`] projection) and to [`EventStore::renew`] one already
+/// held. A caller cannot assemble a lease out of data the API published about
+/// somebody else's hold.
+///
+/// This is what makes the disclosure on [`ClaimOutcome::Contended`] safe. Before
+/// it, a losing claimant could read the canonical [`Event`], take the disclosed
+/// holder and fence, build the winner's lease by struct literal, and terminally
+/// acknowledge work it never performed.
+///
+/// # Design position: possession is the capability, and it depends on opacity
+///
+/// [`EventStore::renew`], [`EventStore::ack_work`], and [`EventStore::nack_work`]
+/// authenticate the **token**, not the **caller**. They validate the supplied
+/// lease against store state; they have no notion of who is calling, and the
+/// [`Authorizer`] seam decides only whether a consumer may touch a topic at all.
+/// So a `Lease` is a capability: possessing one *is* the authority to mutate that
+/// item, and handing one to another component hands over that authority.
+///
+/// **Possession-as-capability requires that the token be unconstructable.
+/// Otherwise disclosure leaks the capability.**
+///
+/// That dependency is the whole point of this section. Validation gates on an
+/// exact match of owner, fence, and canonical event. The event is public. When
+/// `Contended` disclosed both the holder and the active fence, and `Lease` fields
+/// were public, all three checks were satisfiable by a *constructed* lease — the
+/// disclosed fence was the forge material. Opacity and disclosure are therefore
+/// **coupled**, not independent: either the token is unconstructable, which makes
+/// `(holder, fence)` inert data, or the fence must never be disclosed.
+///
+/// This crate does both, deliberately. Do not relax one on the grounds that the
+/// other covers it. Re-adding a public constructor "because the fence is not
+/// disclosed anyway" reopens the hole, and so does re-disclosing the fence
+/// "because the lease is opaque anyway".
+///
+/// Caller authentication distinct from token possession is intentionally **not**
+/// implemented here. A backend whose threat model needs mutations bound to an
+/// authenticated principal — rather than to whoever holds the token — must add
+/// that binding itself.
+///
+/// # Forging a lease does not compile
+///
+/// ```compile_fail
+/// use interlockutor::{ConsumerId, Event, Fence, Lease};
+///
+/// // A losing claimant has the canonical event and the disclosed holder, and
+/// // still cannot build the winner's lease: the fields are private.
+/// fn forge(event: Event, holder: ConsumerId) -> Lease {
+///     Lease {
+///         event,
+///         owner: holder,
+///         fence: Fence(1),
+///         expires_at: u64::MAX,
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Lease {
-    pub event: Event,
-    pub owner: ConsumerId,
-    pub fence: Fence,
-    pub expires_at: Timestamp,
+    event: Event,
+    owner: ConsumerId,
+    fence: Fence,
+    expires_at: Timestamp,
+}
+
+impl Lease {
+    /// The leased event.
+    pub fn event(&self) -> &Event {
+        &self.event
+    }
+
+    /// The consumer this lease was granted to.
+    pub fn owner(&self) -> &ConsumerId {
+        &self.owner
+    }
+
+    /// The fencing token this lease was issued under.
+    ///
+    /// Readable only by a holder, who by definition already has the token. It is
+    /// deliberately absent from [`ClaimOutcome::Contended`], where it would be
+    /// readable by a *non*-holder.
+    pub fn fence(&self) -> Fence {
+        self.fence
+    }
+
+    /// When this lease lapses, in the store's clock domain.
+    pub fn expires_at(&self) -> Timestamp {
+        self.expires_at
+    }
 }
 
 /// The detailed outcome of one claim attempt.
 ///
-/// This is the protocol contract for claiming. [`EventStore::claim`] is a lossy
+/// This is the protocol contract for claiming. [`EventStoreExt::claim`] is a lossy
 /// projection of it, kept for compatibility; new consumers should match on this
 /// type so a losing claimant can distinguish "someone else holds this right
 /// now" from "there is nothing to do".
@@ -184,14 +271,36 @@ pub struct Lease {
 /// small as the contract allows, a contended outcome names exactly one holder
 /// — the lowest-sequence live-contended event — never the full contention set.
 ///
-/// # `holder` is a coordination identifier, not a credential
+/// # The disclosed set is data, not capability — because a [`Lease`] cannot be built
 ///
-/// Possessing another consumer's [`ConsumerId`] confers no authority whatsoever.
-/// Every lease mutation is gated by an exact match on both the active fencing
-/// token and the recorded owner, so a disclosed holder cannot be replayed to
-/// renew, acknowledge, release, or steal that lease. Future backend authors must
-/// not read holder disclosure as "here is a token you can use": it is data for
-/// scheduling and diagnostics, and nothing else.
+/// What is disclosed is `event_id`, `holder`, and `expires_at`: enough to name the
+/// winner and schedule a retry. The **active fence is not disclosed**. It is
+/// internal ordering data that a losing claimant never needed, and disclosing it
+/// was what turned this outcome into forge material.
+///
+/// The guarantee that these values are inert rests on [`Lease`] being
+/// unconstructable outside this crate, *not* on the mutation checks alone. Lease
+/// mutations validate owner, fence, and canonical event against store state — all
+/// three of which a caller could once satisfy by assembling a lease from published
+/// data. They are inert now because there is no route from `event_id`, `holder`,
+/// and `expires_at` to a `Lease` value at all.
+///
+/// Both halves are required, and they are coupled. See the design note on
+/// [`Lease`] before relaxing either: re-adding a public lease constructor or
+/// re-disclosing the fence individually reopens the same hole.
+///
+/// # Reading a fence off a contended outcome does not compile
+///
+/// ```compile_fail
+/// use interlockutor::{ClaimOutcome, Fence};
+///
+/// fn holders_fence(outcome: &ClaimOutcome) -> Option<Fence> {
+///     match outcome {
+///         ClaimOutcome::Contended { fence, .. } => Some(*fence),
+///         _ => None,
+///     }
+/// }
+/// ```
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ClaimOutcome {
     /// The caller now holds the lease described here.
@@ -202,18 +311,27 @@ pub enum ClaimOutcome {
     /// Acknowledged work and fence-exhausted work have no current holder and are
     /// never reported here, so a stale owner of finished work is never named.
     ///
+    /// `holder` may be the calling consumer itself. A consumer that already holds
+    /// the only live item in a topic, and claims again, is told that it is the
+    /// holder. That is not an error and not a disclosure: it is the same fact the
+    /// caller already had.
+    ///
     /// When several earlier events are concurrently leased, this names the one
-    /// with the **lowest sequence within the topic**. [`EventStore::claim`] does
-    /// not name an [`EventId`], so the choice is fixed by scan order to keep the
+    /// with the **lowest sequence within the topic**. [`EventStore::claim_detailed`]
+    /// takes no [`EventId`], so the choice is fixed by scan order to keep the
     /// outcome deterministic.
+    ///
+    /// The holder's active fencing token is deliberately **not** reported. It is
+    /// internal ordering data with no scheduling value to a losing claimant, and
+    /// disclosing it supplied the last field needed to forge the holder's lease
+    /// back when [`Lease`] was constructible. Do not reintroduce it, or any
+    /// equivalent projection of it.
     Contended {
         /// The contended event.
         event_id: EventId,
         /// The consumer currently holding the lease. See the type-level note:
-        /// this is an identifier, not a credential.
+        /// this names the winner, and confers nothing.
         holder: ConsumerId,
-        /// The holder's active fencing token; higher means more recent.
-        fence: Fence,
         /// When the holder's lease lapses, after which reclaim can succeed.
         /// This is what makes a scheduled retry possible instead of a blind one.
         expires_at: Timestamp,
@@ -223,7 +341,7 @@ pub enum ClaimOutcome {
 }
 
 impl ClaimOutcome {
-    /// Projects onto the lossy [`EventStore::claim`] shape.
+    /// Projects onto the lossy [`EventStoreExt::claim`] shape.
     ///
     /// `Granted` becomes `Some`; `Contended` and `Empty` both collapse to
     /// `None`. This is the single definition of that projection, so
@@ -340,6 +458,33 @@ impl Authorizer for AllowAll {
 /// Delivery is at-least-once. Effects performed by consumers must therefore be
 /// idempotent. Ordering is guaranteed per topic, never globally.
 ///
+/// # Known break: out-of-crate backends cannot currently implement this
+///
+/// [`EventStore::claim_detailed`] and [`EventStore::renew`] return [`Lease`]
+/// values, and `Lease` is deliberately unconstructable outside this crate. A
+/// third-party backend therefore has no way to produce one, so as of this commit
+/// **only in-crate backends can implement `EventStore`**.
+///
+/// That is a real regression against the stated goal that persistent and
+/// distributed backends implement this trait and pass the same conformance
+/// suite. It is recorded here rather than quietly resolved, because the obvious
+/// resolutions are all weaker than they look:
+///
+/// - **A public minting constructor** returns the crate to the state that made
+///   forgery possible. Not an option.
+/// - **A cargo feature gating minting** is build-time role separation, not a
+///   security boundary: features unify across a dependency graph, so any crate
+///   in the binary enabling it re-opens forgery for every other crate.
+/// - **A sealed minting trait** cannot be implemented by the third party that
+///   needs it — sealing is what excludes them in the first place.
+/// - **A store-bound lease**, where a minted token is only valid against the
+///   store that issued it, is the shape that actually works. It needs a store
+///   identity concept the crate does not have yet.
+///
+/// The seam is unresolved and needs a design decision. Reopening construction to
+/// unblock an implementor without solving it would reintroduce the vulnerability
+/// this commit closes.
+///
 /// This synchronous trait is the local/reference contract. Network adapters
 /// should expose their own asynchronous API rather than blocking an async
 /// runtime behind this trait. The central store owns lease time; distributed
@@ -388,30 +533,9 @@ pub trait EventStore: Send + Sync {
         lease_for: Duration,
     ) -> Result<ClaimOutcome, Error>;
 
-    /// Claims the first available event, discarding why a claim failed.
-    ///
-    /// This is the **lossy compatibility surface, not the protocol contract**.
-    /// `Ok(None)` collapses "another consumer holds this right now" together
-    /// with "there is nothing to do", so a losing claimant cannot tell them
-    /// apart or learn when to come back. New consumers should call
-    /// [`EventStore::claim_detailed`] instead.
-    ///
-    /// Do not override this. It is a projection of the single authoritative
-    /// result computed by [`EventStore::claim_detailed`]; a second
-    /// implementation would be a correctness hazard, because the two paths could
-    /// take separate locks and observe different states.
-    fn claim(
-        &self,
-        consumer: &ConsumerId,
-        topic: &Topic,
-        lease_for: Duration,
-    ) -> Result<Option<Lease>, Error> {
-        Ok(self.claim_detailed(consumer, topic, lease_for)?.granted())
-    }
-
     /// Renews a current lease without changing its owner or fence.
     ///
-    /// Duration validation is identical to [`EventStore::claim`].
+    /// Duration validation is identical to [`EventStore::claim_detailed`].
     fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error>;
 
     /// Makes work terminal in this store; it does not transact external effects.
@@ -427,6 +551,70 @@ pub trait EventStore: Send + Sync {
     /// Releases work immediately. The next claim receives a higher fence
     /// unless this lease consumed the last fencing token.
     fn nack_work(&self, lease: &Lease) -> Result<(), Error>;
+}
+
+mod sealed {
+    /// Blanket-implemented for every backend and implementable by nobody else,
+    /// so [`super::EventStoreExt`] cannot be given a second body downstream.
+    pub trait Sealed {}
+    impl<T: super::EventStore + ?Sized> Sealed for T {}
+}
+
+/// The lossy compatibility projection of [`EventStore::claim_detailed`].
+///
+/// This lives outside [`EventStore`] on purpose. As a *provided trait method* it
+/// was overridable: a backend could supply its own `claim` body, and then the
+/// documented equivalence `claim(..) == claim_detailed(..)?.granted()` would hold
+/// only by that author's goodwill — two computations, two lock acquisitions, two
+/// chances to observe different state. The doc said "by construction" over
+/// something a downstream impl could replace.
+///
+/// It is now a blanket impl over every `T: EventStore`, sealed by a private
+/// supertrait. There is exactly one body, no backend can substitute another, and
+/// the equivalence really does hold by construction.
+///
+/// Backends implement [`EventStore`] and get this for free. Callers need
+/// `EventStoreExt` in scope to call [`EventStoreExt::claim`].
+///
+/// # Substituting the projection does not compile
+///
+/// ```compile_fail
+/// use interlockutor::{ConsumerId, Error, EventStoreExt, Lease, Topic};
+/// use std::time::Duration;
+///
+/// struct Backend;
+///
+/// impl EventStoreExt for Backend {
+///     fn claim(&self, _: &ConsumerId, _: &Topic, _: Duration) -> Result<Option<Lease>, Error> {
+///         Ok(None)
+///     }
+/// }
+/// ```
+pub trait EventStoreExt: EventStore + sealed::Sealed {
+    /// Claims the first available event, discarding why a claim failed.
+    ///
+    /// This is the **lossy compatibility surface, not the protocol contract**.
+    /// `Ok(None)` collapses "another consumer holds this right now" together
+    /// with "there is nothing to do", so a losing claimant cannot tell them
+    /// apart or learn when to come back. New consumers should call
+    /// [`EventStore::claim_detailed`] instead.
+    fn claim(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        lease_for: Duration,
+    ) -> Result<Option<Lease>, Error>;
+}
+
+impl<T: EventStore + ?Sized> EventStoreExt for T {
+    fn claim(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        lease_for: Duration,
+    ) -> Result<Option<Lease>, Error> {
+        Ok(self.claim_detailed(consumer, topic, lease_for)?.granted())
+    }
 }
 
 #[derive(Clone)]
@@ -623,10 +811,11 @@ impl EventStore for MemoryStore {
             // Terminal and fence-exhausted items yield neither a grant nor a
             // holder, so they fall through both arms and are simply skipped.
             if let Some(holder) = outcome.contended() {
+                // The holder's fence stays inside the kernel record. It is never
+                // projected into the outcome: see the note on `Contended`.
                 contended.get_or_insert_with(|| ClaimOutcome::Contended {
                     event_id: event.id.clone(),
                     holder: holder.owner.clone(),
-                    fence: holder.fence,
                     expires_at: holder.expires_at,
                 });
                 continue;
