@@ -36,7 +36,9 @@
 //! | 3. `sync_all` file | staging file with unflushed bytes; removed on the error path | identical to step 2 — the debris shape is the same | correct | debris shape covered by the step-2 test; the fsync error itself is argued |
 //! | 4. `hard_link` | `AlreadyExists` means another attempt's entry is present; any other error leaves no entry | `AlreadyExists` → durability repair, then full-receipt validation | correct | `simultaneous_couriers_record_the_effect_exactly_once`, `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
 //! | 5. `sync_all` `effects/` | **entry is visible but may not be crash-durable**, and `commit` returns `Err` | `AlreadyExists`; the retry re-fsyncs `effects/` *before* validating, and propagates a repeated failure | correct — previously a courier could ACK a non-durable entry | `post_link_directory_sync_failure_is_repaired_before_existing_is_returned` |
-//! | scavenge | a **live** staging name can be removed when an attempt outlives `stale_after` | that attempt's `hard_link` fails with `NotFound` | attempt fails loudly; `effects/` is never wrong and never duplicated | `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` |
+//! | 6. remove staging | the record is committed but debris remains in `tmp/` | the record is already in `effects/`, so redelivery reports `Existing` | attempt reports `Err` over a durable record; conservative, never duplicated | `a_failed_staging_cleanup_is_reported_rather_than_swallowed`, `a_cleanup_failure_never_masks_the_primary_failure` |
+//! | scavenge, known age | a **live** staging name can be removed when an attempt outlives `stale_after` | that attempt's `hard_link` fails with `NotFound` | attempt fails loudly; `effects/` is never wrong and never duplicated | `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` |
+//! | scavenge, unknown age | the entry is moved to `quarantine/`, never deleted | staging name is gone, so a live attempt's `hard_link` fails with `NotFound` | attempt fails loudly; the bytes are preserved for recovery | `future_dated_staging_files_are_quarantined_rather_than_reaped` |
 //! | `Existing` validation | — | a record at the right path is only acceptance if it equals the expected receipt in full | mismatch is `UnusableRecord`, never `Existing`, never repaired in place | `corrupt_existing_record_is_not_reported_as_prior_acceptance` |
 //!
 //! ## Untested cells, stated rather than smoothed over
@@ -60,6 +62,16 @@
 //! have its live staging name removed by a concurrent reaper. The claim is now
 //! narrowed to match the mechanism, and zero-age reaping is confined to an
 //! explicitly exclusive entry point. See [`EffectStore::scavenge`].
+//!
+//! Age being the only evidence cuts both ways, and the scavenger used to get the
+//! second direction backwards: an entry whose mtime was unreadable or dated in
+//! the future was treated as *maximally* stale and deleted on the spot, at any
+//! window, bypassing the `MIN_CONCURRENT_STALE_AFTER` floor entirely. No
+//! evidence of age is not evidence of abandonment — a future-dated file is a
+//! clock step or a nonmonotonic filesystem, and is at least as likely to be live
+//! work. Only known ages meeting the threshold are reaped now. Entries with no
+//! establishable age are moved to `quarantine/`, out of the staging namespace
+//! but intact, for an operator or an exclusive recovery pass.
 
 use interlockutor::{
     AllowAll, AppendOutcome, ClaimOutcome, Clock, ConsumerId, Error, Event, EventId, EventStore,
@@ -254,6 +266,7 @@ fn acceptance_receipt(event: &Event) -> AcceptanceReceipt {
 #[derive(Default)]
 struct Faults {
     dir_syncs_to_fail: AtomicU64,
+    staging_removals_to_fail: AtomicU64,
 }
 
 /// Test recipient whose effect records outlive any one courier attempt.
@@ -311,6 +324,7 @@ impl EffectStore {
         fs::create_dir_all(store.effects_dir())?;
         fs::create_dir_all(store.staging_dir())?;
         fs::create_dir_all(store.duplicates_dir())?;
+        fs::create_dir_all(store.quarantine_dir())?;
         store.sync_dir(&store.root)?;
         store.scavenge(stale_after)?;
         Ok(store)
@@ -319,6 +333,46 @@ impl EffectStore {
     /// Makes the next `n` directory syncs on this store fail.
     fn fail_next_dir_syncs(&self, n: u64) {
         self.faults.dir_syncs_to_fail.store(n, Ordering::SeqCst);
+    }
+
+    /// Makes the next `n` staging-file removals on this store fail.
+    fn fail_next_staging_removals(&self, n: u64) {
+        self.faults
+            .staging_removals_to_fail
+            .store(n, Ordering::SeqCst);
+    }
+
+    /// Removes a staging file, reporting failure instead of discarding it.
+    ///
+    /// This was `let _ = fs::remove_file(staging);` on every path. The module
+    /// docs promise the staging file is "always removed, on every outcome, so
+    /// crashed attempts are the only thing scavenging ever has to handle" — and
+    /// a discarded error silently falsified exactly that promise, leaving debris
+    /// that looks identical to a crashed attempt with nothing having reported a
+    /// problem.
+    ///
+    /// The postcondition is **the staging name is gone**, not *this attempt
+    /// removed it*. `NotFound` therefore satisfies it: a concurrent scavenger is
+    /// entitled to reap the name at any moment, so treating "someone else
+    /// already removed it" as a cleanup failure would report an error for a
+    /// commit that fully succeeded. That distinction is what
+    /// `live_staging_file_may_be_reaped_and_the_attempt_fails_loudly` exercises
+    /// on its concurrent path.
+    fn remove_staging(&self, staging: &Path) -> io::Result<()> {
+        if self
+            .faults
+            .staging_removals_to_fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(io::Error::other("injected staging removal failure"));
+        }
+        match fs::remove_file(staging) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            other => other,
+        }
     }
 
     /// Flushes a directory's entries to stable storage.
@@ -365,6 +419,12 @@ impl EffectStore {
         self.root.join("duplicates")
     }
 
+    /// Holds staging entries whose age could not be established. Never read as
+    /// an effect, never reaped by age — see [`EffectStore::scavenge`].
+    fn quarantine_dir(&self) -> PathBuf {
+        self.root.join("quarantine")
+    }
+
     /// Shared append log used only by the racy negative control.
     fn naive_log(&self) -> PathBuf {
         self.root.join("naive-log")
@@ -398,6 +458,27 @@ impl EffectStore {
     /// Making this exact rather than heuristic needs real ownership evidence —
     /// an advisory lock, a liveness marker, or linking from an open descriptor
     /// so the pathname stops mattering. That is deliberately not done here.
+    /// # Unknown and future-dated mtimes are quarantined, never reaped
+    ///
+    /// Age is the only evidence, so an entry whose age cannot be *established*
+    /// carries no evidence at all. This previously treated those entries as
+    /// stale and deleted them immediately — the exact opposite of what the
+    /// evidence supports, and a bypass of the `stale_after` floor that
+    /// [`EffectStore::open_with`] exists to enforce. A file with an unreadable
+    /// mtime, or one dated in the future because of a clock step or a
+    /// nonmonotonic filesystem, is *more* likely to be live work than debris,
+    /// and a concurrently-opened store would delete it at age zero.
+    ///
+    /// Such entries are now moved to `quarantine/` instead: out of the staging
+    /// namespace so they cannot be confused with an in-flight attempt or
+    /// re-reaped on every open, but preserved for an operator or an exclusive
+    /// recovery pass to inspect. Quarantining a *live* stage has the same
+    /// conservative failure as reaping one — that attempt's `hard_link` fails
+    /// with `NotFound` and records nothing — but it destroys no evidence.
+    ///
+    /// Only entries whose age is known **and** at least `stale_after` are
+    /// removed. The returned count is removals; quarantined entries are counted
+    /// separately by [`EffectStore::quarantine_entries`].
     fn scavenge(&self, stale_after: Duration) -> Result<usize, AcceptError> {
         let mut removed = 0;
         for entry in fs::read_dir(self.staging_dir())? {
@@ -410,48 +491,103 @@ impl EffectStore {
                 .modified()
                 .ok()
                 .and_then(|modified| SystemTime::now().duration_since(modified).ok());
-            // An unreadable or future-dated mtime is treated as stale rather
-            // than as a reason to keep debris forever.
-            if age.is_none_or(|age| age >= stale_after) && fs::remove_file(entry.path()).is_ok() {
-                removed += 1;
+            match age {
+                // Known age, old enough: this is the only case age actually
+                // licenses removing.
+                Some(age) if age >= stale_after => {
+                    if fs::remove_file(entry.path()).is_ok() {
+                        removed += 1;
+                    }
+                }
+                // Known age, too young: leave it, it may be a live attempt.
+                Some(_) => {}
+                // Age unknown or in the future: no evidence either way.
+                None => self.quarantine(&entry.path())?,
             }
         }
         Ok(removed)
     }
 
+    /// Moves an entry whose age could not be established out of `tmp/`.
+    ///
+    /// A collision in `quarantine/` means an earlier pass already preserved a
+    /// file under that name; the newer one is kept alongside under a suffixed
+    /// name rather than overwriting evidence.
+    fn quarantine(&self, staging: &Path) -> Result<(), AcceptError> {
+        let name = staging
+            .file_name()
+            .expect("a staging entry always has a file name");
+        let mut target = self.quarantine_dir().join(name);
+        while target.exists() {
+            let mut next = name.to_os_string();
+            next.push(format!(".{}", STAGING_ID.fetch_add(1, Ordering::Relaxed)));
+            target = self.quarantine_dir().join(next);
+        }
+        fs::rename(staging, &target)?;
+        Ok(())
+    }
+
     /// Records the effect for `event` exactly once, keyed by [`EventId`].
+    ///
+    /// # Redelivery does not write anything
+    ///
+    /// At-least-once delivery means the common case for an already-accepted
+    /// event is a *retry*, and this used to run the full commit for one:
+    /// create a staging file, write the record, `fsync` it, attempt the link,
+    /// get `AlreadyExists`, then unlink the staging file — a write and a
+    /// durability barrier per redelivery, to learn something already on disk.
+    ///
+    /// The existence check now comes first. That is purely an optimization and
+    /// it weakens nothing: `hard_link` is still the only thing that decides who
+    /// records, so two attempts that both observe absence still race into the
+    /// link and exactly one wins. A hit on the fast path takes the identical
+    /// durability repair and full-record validation as the `AlreadyExists` path,
+    /// which remains in place for the racing case.
     fn accept(&self, event: &Event) -> Result<AcceptanceOutcome, AcceptError> {
         let target = self.record_path(&event.id)?;
         let receipt = acceptance_receipt(event);
+        if target.exists() {
+            return self.validate_existing(&target, &receipt);
+        }
         match self.commit(&target, &receipt)? {
             Commit::Linked => Ok(AcceptanceOutcome::Recorded(receipt)),
-            Commit::AlreadyExists => {
-                let parent = target.parent().expect("record path has a parent directory");
-                // Durability repair, before anything is called acceptance. A
-                // previous attempt can have linked the entry and then failed its
-                // directory fsync: it returned an error, but left the entry
-                // visible. Without re-syncing here, this path would report a
-                // prior acceptance for an entry that was never made crash-
-                // durable, and the courier would ACK work that can still vanish.
-                self.sync_dir(parent)?;
-
-                // The filename alone is not a durable receipt: a path can exist
-                // with a truncated, empty, corrupt, or substituted body. Read it
-                // and require it to equal the receipt this event deterministically
-                // produces — the whole record, not just its key. Matching only
-                // the event id accepted any record filed under the right name,
-                // including one carrying somebody else's receipt.
-                let existing = self.read_record(&target)?;
-                if existing != receipt {
-                    return Err(AcceptError::unusable(
-                        &target,
-                        format!("record {existing:?} is not the expected receipt {receipt:?}"),
-                        None,
-                    ));
-                }
-                Ok(AcceptanceOutcome::Existing(existing))
-            }
+            Commit::AlreadyExists => self.validate_existing(&target, &receipt),
         }
+    }
+
+    /// Repairs durability, then decides whether an existing entry is acceptance.
+    ///
+    /// Shared by the redelivery fast path and the racing `AlreadyExists` path so
+    /// the two cannot drift: any weakening here would have to be made twice.
+    fn validate_existing(
+        &self,
+        target: &Path,
+        receipt: &AcceptanceReceipt,
+    ) -> Result<AcceptanceOutcome, AcceptError> {
+        let parent = target.parent().expect("record path has a parent directory");
+        // Durability repair, before anything is called acceptance. A previous
+        // attempt can have linked the entry and then failed its directory
+        // fsync: it returned an error, but left the entry visible. Without
+        // re-syncing here, this path would report a prior acceptance for an
+        // entry that was never made crash-durable, and the courier would ACK
+        // work that can still vanish.
+        self.sync_dir(parent)?;
+
+        // The filename alone is not a durable receipt: a path can exist with a
+        // truncated, empty, corrupt, or substituted body. Read it and require it
+        // to equal the receipt this event deterministically produces — the whole
+        // record, not just its key. Matching only the event id accepted any
+        // record filed under the right name, including one carrying somebody
+        // else's receipt.
+        let existing = self.read_record(target)?;
+        if &existing != receipt {
+            return Err(AcceptError::unusable(
+                target,
+                format!("record {existing:?} is not the expected receipt {receipt:?}"),
+                None,
+            ));
+        }
+        Ok(AcceptanceOutcome::Existing(existing))
     }
 
     /// Negative control A: the identical commit protocol with the [`EventId`]
@@ -569,6 +705,10 @@ impl EffectStore {
             });
         drop(file);
         if let Err(error) = staged {
+            // Deliberately discarded, unlike the cleanup in `link_staged`: this
+            // path is already failing, and the write error is the cause the
+            // caller needs. A failure to remove leaves debris in `tmp/`, which
+            // is exactly what scavenging exists for.
             let _ = fs::remove_file(&staging);
             return Err(AcceptError::Io(error));
         }
@@ -577,8 +717,19 @@ impl EffectStore {
 
     /// Steps 4 and 5: publish the staged record, then make the entry durable.
     ///
-    /// Always removes the staging file, on every outcome, so crashed attempts
-    /// are the only thing scavenging ever has to handle.
+    /// Removes the staging file on every outcome, so crashed attempts are the
+    /// only thing scavenging ever has to handle — and **reports** it when that
+    /// removal fails rather than discarding the error, since a silent failure
+    /// leaves debris indistinguishable from a crash.
+    ///
+    /// A cleanup failure never masks a primary failure: if the link or the
+    /// directory sync already failed, that error is the one returned, because it
+    /// is the cause. A cleanup failure over an otherwise successful commit *is*
+    /// surfaced, which conservatively turns a durable commit into a reported
+    /// error. That is safe here — the record is keyed by `EventId`, so the
+    /// courier's retry observes it via the redelivery path and accepts once —
+    /// and it is preferable to returning success while the stated invariant is
+    /// quietly broken.
     fn link_staged(&self, staging: &Path, target: &Path) -> Result<Commit, AcceptError> {
         // 4. atomically link into place; fails if the target already exists
         let linked = fs::hard_link(staging, target);
@@ -597,8 +748,13 @@ impl EffectStore {
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(Commit::AlreadyExists),
             Err(error) => Err(AcceptError::Io(error)),
         };
-        let _ = fs::remove_file(staging);
-        result
+        let cleaned = self.remove_staging(staging);
+        // The primary outcome wins: a cleanup failure must not hide its cause.
+        match (result, cleaned) {
+            (Ok(commit), Ok(())) => Ok(commit),
+            (Ok(_), Err(error)) => Err(AcceptError::Io(error)),
+            (Err(primary), _) => Err(primary),
+        }
     }
 
     /// The five-step commit. `target`'s parent directory must already exist.
@@ -647,6 +803,10 @@ impl EffectStore {
 
     fn staging_entries(&self) -> Result<usize, AcceptError> {
         Ok(fs::read_dir(self.staging_dir())?.count())
+    }
+
+    fn quarantine_entries(&self) -> Result<usize, AcceptError> {
+        Ok(fs::read_dir(self.quarantine_dir())?.count())
     }
 }
 
@@ -1357,5 +1517,214 @@ fn check_then_append_recipient_duplicates_where_the_atomic_link_does_not()
     );
     assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
     store.ack_work(&fresh_lease)?;
+    Ok(())
+}
+
+/// A staging file whose age cannot be established is quarantined, not deleted.
+///
+/// Age is the scavenger's only evidence, so an entry that carries none must not
+/// be treated as the *most* stale thing in the directory. It was: an unreadable
+/// or future-dated mtime reaped immediately, at any window, which bypassed the
+/// `MIN_CONCURRENT_STALE_AFTER` floor that `open_with` exists to enforce — and a
+/// future-dated mtime is a clock step or a nonmonotonic filesystem, not evidence
+/// of abandonment.
+///
+/// A future-dated file is used because it is the reachable half of the same
+/// branch: `duration_since` fails, `age` is `None`, and the unreadable-mtime
+/// case joins it there.
+#[cfg(unix)]
+#[test]
+fn future_dated_staging_files_are_quarantined_rather_than_reaped() -> Result<(), Box<dyn StdError>>
+{
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let receipt = acceptance_receipt(&appended);
+
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open_exclusive(scratch.path(), Duration::ZERO)?;
+    let staging = recipient.stage(&receipt)?;
+
+    // Date it an hour into the future: `SystemTime::now().duration_since` fails,
+    // so the age is unknown.
+    let future = SystemTime::now() + Duration::from_secs(3600);
+    File::options()
+        .write(true)
+        .open(&staging)?
+        .set_times(fs::FileTimes::new().set_modified(future))?;
+
+    // Even a zero window — the most aggressive setting there is — must not
+    // delete it.
+    assert_eq!(
+        recipient.scavenge(Duration::ZERO)?,
+        0,
+        "an unknown age is not evidence of staleness"
+    );
+    assert!(!staging.exists(), "the entry left the staging namespace");
+    assert_eq!(recipient.staging_entries()?, 0);
+    assert_eq!(
+        recipient.quarantine_entries()?,
+        1,
+        "the entry is preserved for exclusive recovery"
+    );
+
+    // The bytes survived: quarantine preserves evidence, it does not destroy it.
+    let preserved = fs::read_dir(recipient.quarantine_dir())?
+        .next()
+        .ok_or("quarantine should hold the entry")??;
+    assert_eq!(recipient.read_record(&preserved.path())?, receipt);
+
+    // Repeated passes do not re-quarantine or lose anything.
+    assert_eq!(recipient.scavenge(Duration::ZERO)?, 0);
+    assert_eq!(recipient.quarantine_entries()?, 1);
+
+    // A known-age entry alongside it is still reaped normally, so quarantining
+    // did not disable the scavenger.
+    let ordinary = recipient.stage(&receipt)?;
+    assert_eq!(recipient.scavenge(Duration::ZERO)?, 1);
+    assert!(!ordinary.exists());
+    assert_eq!(recipient.quarantine_entries()?, 1);
+    Ok(())
+}
+
+/// A young staging file is left alone even when its age is known.
+///
+/// The complement of the quarantine case: the floor is only meaningful if a
+/// known age *below* it is also refused.
+#[cfg(unix)]
+#[test]
+fn known_young_staging_files_are_neither_reaped_nor_quarantined() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open_with(scratch.path(), MIN_CONCURRENT_STALE_AFTER)?;
+    let staging = recipient.stage(&acceptance_receipt(&appended))?;
+
+    assert_eq!(recipient.scavenge(MIN_CONCURRENT_STALE_AFTER)?, 0);
+    assert!(staging.exists(), "a fresh stage is live work");
+    assert_eq!(recipient.quarantine_entries()?, 0);
+    Ok(())
+}
+
+/// A failed staging cleanup is reported, not discarded.
+///
+/// The module docs promise the staging file is removed on every outcome. The
+/// removal was `let _ = fs::remove_file(..)`, so a failure silently falsified
+/// that promise and left debris identical in shape to a crashed attempt, with
+/// nothing having reported anything.
+#[cfg(unix)]
+#[test]
+fn a_failed_staging_cleanup_is_reported_rather_than_swallowed() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+
+    // The link and the directory sync both succeed; only the cleanup fails.
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open(scratch.path())?;
+    recipient.fail_next_staging_removals(1);
+    let error = recipient
+        .accept(&appended)
+        .err()
+        .ok_or("a failed staging cleanup must be reported")?;
+    assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
+    assert!(
+        StdError::source(&error).is_some(),
+        "the underlying I/O error must stay attached"
+    );
+
+    // Conservative, not corrupting: the effect *is* recorded, and the courier's
+    // retry observes it exactly once rather than recording a second time.
+    assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
+    assert_eq!(
+        recipient.accept(&appended)?,
+        AcceptanceOutcome::Existing(acceptance_receipt(&appended))
+    );
+    assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
+    Ok(())
+}
+
+/// A cleanup failure must not mask the primary failure that caused it.
+#[cfg(unix)]
+#[test]
+fn a_cleanup_failure_never_masks_the_primary_failure() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open(scratch.path())?;
+
+    // Both the post-link directory sync and the cleanup fail. The reported
+    // error must be the durability failure, which is the one that matters.
+    recipient.fail_next_dir_syncs(1);
+    recipient.fail_next_staging_removals(1);
+    let error = recipient
+        .accept(&appended)
+        .err()
+        .ok_or("a failed directory sync must not report acceptance")?;
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("directory sync"),
+        "the primary failure must survive: {rendered}"
+    );
+    Ok(())
+}
+
+/// Redelivery of an accepted event writes nothing at all.
+///
+/// At-least-once delivery makes redelivery the common case, and it used to cost
+/// a staging create, a full record write, an `fsync`, a failed link and an
+/// unlink — every time — to discover a record that was already on disk. The
+/// existence check now comes first.
+///
+/// Measured by fault injection rather than by timing: staging removals are armed
+/// to fail, so *if* the fast path staged anything the attempt would report an
+/// error. It returns `Existing`, so it did not stage.
+#[cfg(unix)]
+#[test]
+fn redelivery_of_an_accepted_event_does_not_stage_or_fsync() -> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open(scratch.path())?;
+    assert!(matches!(
+        recipient.accept(&appended)?,
+        AcceptanceOutcome::Recorded(_)
+    ));
+
+    // Armed for a whole sequence of attempts: any staging at all trips it.
+    recipient.fail_next_staging_removals(16);
+    for _ in 0..4 {
+        assert_eq!(
+            recipient.accept(&appended)?,
+            AcceptanceOutcome::Existing(acceptance_receipt(&appended))
+        );
+    }
+    assert_eq!(recipient.staging_entries()?, 0, "nothing was staged");
+    assert_eq!(recipient.receipts()?, vec![acceptance_receipt(&appended)]);
+
+    // The racing path is unchanged: a first-time event still runs the full
+    // five-step commit, and would trip the armed cleanup fault if it ran.
+    let other = match store.append("dispatcher", event_named("second-message"))? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let error = recipient
+        .accept(&other)
+        .err()
+        .ok_or("a first acceptance must still stage, and so must trip the fault")?;
+    assert!(matches!(error, AcceptError::Io(_)), "unexpected {error:?}");
     Ok(())
 }

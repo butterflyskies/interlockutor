@@ -152,6 +152,85 @@ The format is based on [Keep a Changelog], and this project adheres to
   it is satisfied exactly when `EventStore` is and excludes no type on its own.
   The guarantee is unchanged and real; the attribution was wrong.
 
+- **Performance:** `MemoryStore::claim_detailed` no longer clones the entire
+  retained topic — every `Event`, and so every `Payload` — on every claim. The
+  clone existed only to dodge a borrow conflict between `topics` and `work`;
+  disjoint field borrows remove it, and exactly one `Event` is now cloned, the
+  one actually granted.
+
+  The scan also no longer restarts at sequence one. A per-topic floor records
+  the first event that is not permanently terminal, so acknowledged and
+  fence-exhausted history is crossed once rather than re-examined on every
+  claim. Each index is stepped over at most once in the store's lifetime, so
+  the floor costs O(1) amortized per claim.
+
+  Behaviour is unchanged: the floor advances only over a *contiguous* terminal
+  prefix, and only over states that are terminal independently of the current
+  time, so no claimable or contended work can be skipped. All pre-existing
+  tests pass unmodified.
+
+  Measured on this workspace, draining a topic of N 512-byte events
+  (append N, then claim-and-ack N), release profile: 500/1000/2000/4000 events
+  took 41.2/163.9/653.1/3176.0 ms before and 0.19/0.38/0.78/1.97 ms after. The
+  before figures quadruple per doubling (quadratic); the after figures double
+  (linear). At N=4000 that is a factor of ~1600.
+
+- **Performance:** `MemoryStore::ack_broadcast` checks sequence existence with a
+  bounds check instead of a linear scan. `append` assigns `len + 1` and pushes,
+  so a topic's sequences are exactly `1..=len`; the scan walked the whole topic
+  to recover what the length already carried, making a drained broadcast cursor
+  quadratic in topic length.
+
+- **Breaking (callers):** added `Error::StorePoisoned`. `MemoryStore` samples its
+  clock while holding the state lock, so a panic inside an injected `Clock::now`
+  poisons that lock — after which every `Result`-returning operation panicked at
+  `lock().expect(..)`, an undocumented panic in a fallible API reachable through
+  the public `MemoryStore::with_clock` seam. The store now fail-stops as a typed
+  error instead.
+
+  Poisoning is permanent and recovery is deliberately not offered, even though
+  the reference store's invariants do survive it — every clock sample is taken
+  either before any mutation in its critical section or after one that already
+  completed. That is a property of this implementation's statement order rather
+  than of the `EventStore` contract, so relying on it would bake a fragile audit
+  into the API. `Error` is exhaustive, so callers matching every variant must
+  add an arm.
+
+- Documented `Lease`'s clone and transfer semantics, which were previously
+  unstated. Unconstructability stops a non-holder from manufacturing a token; it
+  says nothing about a holder passing one on. Every clone is the same capability
+  and authorizes the same mutations; the store, not the token, holds terminal
+  state, so the first successful `ack_work` or `nack_work` invalidates every
+  outstanding copy.
+
+### Fixed (recipient adapter)
+
+- The scavenger no longer deletes staging files whose age cannot be established.
+  An unreadable or future-dated mtime was treated as maximally stale and reaped
+  immediately at any window, bypassing the `MIN_CONCURRENT_STALE_AFTER` floor
+  that `open_with` exists to enforce — despite a future-dated mtime being a
+  clock step or nonmonotonic filesystem, and at least as likely to be live work
+  as debris. Only known ages meeting the threshold are removed; entries with no
+  establishable age are moved to a `quarantine/` directory, intact, for an
+  operator or an exclusive recovery pass.
+
+- Staging-file removal failures are reported instead of discarded. The module
+  docs promise the staging file is removed on every outcome, and
+  `let _ = fs::remove_file(..)` silently falsified that, leaving debris shaped
+  exactly like a crashed attempt with nothing reporting a problem. A cleanup
+  failure never masks the primary failure that preceded it, and `NotFound` is
+  treated as success, since the postcondition is that the name is gone rather
+  than that this attempt removed it — a concurrent scavenger may reap it at any
+  moment.
+
+- Redelivery of an already-accepted event no longer writes and fsyncs a staging
+  file before discovering the existing record. At-least-once delivery makes
+  redelivery the common case, and each one cost a create, a full record write,
+  an fsync, a failed link and an unlink to learn something already on disk. The
+  existence check now runs first; the atomic link remains the only thing that
+  decides who records, so the racing path is unchanged and shares one validation
+  routine with the fast path.
+
 ## [0.3.0] - 2026-07-24
 
 ### Changed
