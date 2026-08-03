@@ -152,6 +152,20 @@ The format is based on [Keep a Changelog], and this project adheres to
   it is satisfied exactly when `EventStore` is and excludes no type on its own.
   The guarantee is unchanged and real; the attribution was wrong.
 
+- A lease that spent the last fencing token no longer pins the claim scan floor
+  forever. A real lease can be granted at `Fence(u64::MAX)`; when it lapses
+  without an acknowledgement or a release, later claims correctly reported
+  fence exhaustion but left the item in a lapsed leased state. That state is not
+  terminal by inspection — deciding it would need the clock, which the floor
+  predicate must not consult — so the floor could never cross the item and every
+  claim on the topic re-examined it for the life of the store, contradicting the
+  amortized `O(1)` the floor exists to provide. Exhaustion is now a typed
+  terminal phase that the claim discovering it records, so the floor crosses it.
+
+  The pre-existing coverage built an exhausted item directly, as available work
+  at the ceiling, and never reached the state the lifecycle actually produces.
+  A grant-to-expiry-to-exhaustion test now does.
+
 - **Performance:** `MemoryStore::claim_detailed` no longer clones the entire
   retained topic — every `Event`, and so every `Payload` — on every claim. The
   clone existed only to dodge a borrow conflict between `topics` and `work`;

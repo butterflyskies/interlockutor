@@ -19,6 +19,16 @@ enum Phase<Owner> {
     Available,
     Leased(LeaseRecord<Owner>),
     Acknowledged,
+    /// The fencing-token space is spent and no lease can ever follow.
+    ///
+    /// This exists so exhaustion is a *phase*, not something a reader has to
+    /// re-derive from `last_issued` plus the current time. A lease issued at
+    /// `Fence(u64::MAX)` leaves a `Leased` record behind when it lapses; that
+    /// record is unclaimable forever, but nothing about the record itself says
+    /// so, since `Leased` is otherwise only temporarily uninteresting. Recording
+    /// the fact here is what lets [`LeaseKernel::is_permanently_terminal`] stay
+    /// time-independent *and* answer `true` for it.
+    Exhausted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +73,9 @@ pub(super) enum Claim<Owner> {
     /// Work was acknowledged. There is no current holder and never will be.
     Terminal,
     /// The last fence was `u64::MAX`; this item can never be leased again.
+    ///
+    /// Reporting this also *records* it: the kernel moves to a terminal
+    /// exhausted phase, so the item stops looking merely uninteresting-for-now.
     FenceExhausted,
 }
 
@@ -112,6 +125,7 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
 
         match &self.phase {
             Phase::Acknowledged => return Claim::Terminal,
+            Phase::Exhausted => return Claim::FenceExhausted,
             Phase::Leased(lease) if lease.expires_at > now => {
                 return Claim::Occupied(lease.clone());
             }
@@ -119,6 +133,17 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
         }
 
         let Some(next) = self.last_issued.0.checked_add(1) else {
+            // Record the exhaustion in the phase rather than only reporting it.
+            //
+            // Reaching here from `Leased` means a lease issued at `Fence(MAX)`
+            // has lapsed with nobody acknowledging or releasing it. Leaving that
+            // lapsed record in place answered every future claim correctly and
+            // still cost one, because `is_permanently_terminal` cannot read a
+            // `Leased` phase as terminal without consulting the clock — so the
+            // store's scan floor could never cross the item and re-examined it
+            // on every claim, forever. `last_issued` is untouched: no fence is
+            // consumed here and none ever wraps.
+            self.phase = Phase::Exhausted;
             return Claim::FenceExhausted;
         };
         let lease = LeaseRecord {
@@ -180,17 +205,26 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
     /// it must be time-independent: a floor is permanent, and an item that is
     /// merely uninteresting *right now* must not be skipped forever.
     ///
-    /// - `Acknowledged` is terminal by construction.
+    /// - `Acknowledged` and `Exhausted` are terminal by construction.
     /// - `Available` with the last fence issued can never be leased again, since
-    ///   the next fence would have to wrap.
-    /// - `Leased` is deliberately excluded, **including** the fence-exhausted
-    ///   case. A live lease is a holder that must still be reported as
-    ///   contention, and an expired one only becomes terminal as time passes.
-    ///   Being conservative here costs at most a re-examined item per claim and
-    ///   keeps the predicate independent of `now`.
+    ///   the next fence would have to wrap. [`LeaseKernel::claim`] normalizes
+    ///   that state to `Exhausted` the first time it is asked, so this arm
+    ///   covers a kernel built directly at the ceiling rather than driven there.
+    /// - `Leased` is excluded. A live lease is a holder that must still be
+    ///   reported as contention, and an expired one only becomes terminal as
+    ///   time passes. Being conservative here costs at most a re-examined item
+    ///   per claim and keeps the predicate independent of `now`.
+    ///
+    ///   The one `Leased` state that is *permanently* dead — a lapsed lease at
+    ///   `Fence(u64::MAX)` — is deliberately not special-cased here. Deciding it
+    ///   would need the clock, which this predicate must not have; `claim`
+    ///   converts it to `Exhausted` instead, so the fact arrives as a phase.
+    ///   Before that conversion existed, such an item pinned the store's scan
+    ///   floor permanently and every later claim re-examined it, contradicting
+    ///   the amortized-`O(1)` guarantee the floor exists to provide.
     pub(super) fn is_permanently_terminal(&self) -> bool {
         match &self.phase {
-            Phase::Acknowledged => true,
+            Phase::Acknowledged | Phase::Exhausted => true,
             Phase::Available => self.last_issued.0 == u64::MAX,
             Phase::Leased(_) => false,
         }
@@ -290,10 +324,66 @@ mod proofs {
             }
             Claim::FenceExhausted => {
                 assert_eq!(previous_fence, u64::MAX);
-                assert_eq!(kernel, before);
+                // No fence is consumed and none wraps, but the exhaustion is
+                // recorded: the item must read as permanently terminal from the
+                // phase alone, and stay put under repeated claims.
+                assert_eq!(kernel.last_issued, before.last_issued);
+                assert!(kernel.is_permanently_terminal());
+                let recorded = kernel.clone();
+                assert_eq!(kernel.claim(3, 0, 1), Claim::FenceExhausted);
+                assert_eq!(kernel, recorded);
             }
             Claim::Occupied(_) | Claim::Terminal => unreachable!(),
         }
+    }
+
+    /// The lifecycle that actually produces a fence-exhausted item.
+    ///
+    /// A synthetic `Available` kernel at the ceiling is not this state. A real
+    /// grant at `Fence(u64::MAX)` that then lapses leaves a `Leased` record
+    /// which is unclaimable forever, and which read as non-terminal until the
+    /// claim that discovers exhaustion records it.
+    #[kani::proof]
+    fn a_lapsed_lease_at_the_last_fence_becomes_permanently_terminal() {
+        let expires_at = kani::any::<u64>();
+        kani::assume(expires_at > 0 && expires_at < u64::MAX);
+        let mut kernel = LeaseKernel::<u8> {
+            last_issued: Fence(u64::MAX - 1),
+            phase: Phase::Available,
+        };
+
+        let Claim::Granted(lease) = kernel.claim(1, 0, expires_at) else {
+            unreachable!()
+        };
+        assert_eq!(lease.fence, Fence(u64::MAX));
+        // While the lease is live it is contention, not terminal.
+        assert!(!kernel.is_permanently_terminal());
+        assert_eq!(kernel.claim(2, 0, expires_at), Claim::Occupied(lease));
+
+        // Once it lapses the item is dead forever, and the claim that discovers
+        // that says so in the phase rather than only in its return value.
+        assert_eq!(
+            kernel.claim(2, expires_at, expires_at + 1),
+            Claim::FenceExhausted
+        );
+        assert!(kernel.is_permanently_terminal());
+        assert_eq!(kernel.last_issued, Fence(u64::MAX));
+
+        // The stale owner of exhausted work is never a holder, and the state is
+        // now a fixed point.
+        let exhausted = kernel.clone();
+        let outcome = kernel.claim(3, expires_at, expires_at + 1);
+        assert_eq!(outcome, Claim::FenceExhausted);
+        assert!(outcome.contended().is_none());
+        assert!(outcome.granted().is_none());
+        assert_eq!(kernel, exhausted);
+
+        // No token works against it either.
+        assert_eq!(
+            kernel.acknowledge(&1, Fence(u64::MAX), expires_at),
+            Err(LeaseError::NotLeased)
+        );
+        assert_eq!(kernel, exhausted);
     }
 
     #[kani::proof]
@@ -372,8 +462,14 @@ mod proofs {
         assert_eq!(last.fence, Fence(u64::MAX));
         assert_eq!(kernel.release(&1, last.fence, 0), Ok(()));
 
-        let exhausted = kernel.clone();
+        assert!(kernel.is_permanently_terminal());
         assert_eq!(kernel.claim(2, 0, 1), Claim::FenceExhausted);
+        assert!(kernel.is_permanently_terminal());
+        assert_eq!(kernel.last_issued, Fence(u64::MAX));
+
+        // Reporting exhaustion is now idempotent on the recorded phase.
+        let exhausted = kernel.clone();
+        assert_eq!(kernel.claim(3, 0, 1), Claim::FenceExhausted);
         assert_eq!(kernel, exhausted);
     }
 
@@ -455,9 +551,10 @@ mod proofs {
     fn any_kernel(now: Timestamp) -> LeaseKernel<u8> {
         let last_issued = Fence(kani::any::<u64>());
         let expires_at = kani::any::<u64>();
-        let phase = match kani::any::<u8>() % 4 {
+        let phase = match kani::any::<u8>() % 5 {
             0 => Phase::Available,
             1 => Phase::Acknowledged,
+            4 => Phase::Exhausted,
             2 => {
                 kani::assume(expires_at > now);
                 Phase::Leased(LeaseRecord {
@@ -525,15 +622,17 @@ mod proofs {
             last_issued: Fence(u64::MAX),
             phase: Phase::Available,
         };
-        let before = exhausted.clone();
         let outcome = exhausted.claim(3, now, now + 1);
         assert_eq!(outcome, Claim::FenceExhausted);
         assert!(outcome.contended().is_none());
         assert!(outcome.granted().is_none());
-        assert_eq!(exhausted, before);
+        assert!(exhausted.is_permanently_terminal());
+        assert_eq!(exhausted.last_issued, Fence(u64::MAX));
 
         // Exhaustion whose record still names the stale owner of expired work.
-        // That owner is not a current holder and must never be disclosed as one.
+        // That owner is not a current holder and must never be disclosed as one
+        // — and the phase must stop carrying the record as if it were live, or
+        // the item is permanently unclaimable while reading as non-terminal.
         let stale_expiry = kani::any::<u64>();
         kani::assume(stale_expiry <= now);
         let mut exhausted_with_stale_owner = LeaseKernel {
@@ -544,12 +643,21 @@ mod proofs {
                 expires_at: stale_expiry,
             }),
         };
-        let before = exhausted_with_stale_owner.clone();
+        assert!(!exhausted_with_stale_owner.is_permanently_terminal());
         let outcome = exhausted_with_stale_owner.claim(3, now, now + 1);
         assert_eq!(outcome, Claim::FenceExhausted);
         assert!(outcome.contended().is_none());
         assert!(outcome.granted().is_none());
-        assert_eq!(exhausted_with_stale_owner, before);
+        assert!(exhausted_with_stale_owner.is_permanently_terminal());
+        assert_eq!(exhausted_with_stale_owner.last_issued, Fence(u64::MAX));
+
+        // Both are fixed points from here on.
+        let settled = exhausted_with_stale_owner.clone();
+        assert_eq!(
+            exhausted_with_stale_owner.claim(4, now, now + 1),
+            Claim::FenceExhausted
+        );
+        assert_eq!(exhausted_with_stale_owner, settled);
     }
 
     /// The kernel-level shadow of the store's `claim == claim_detailed.granted()`

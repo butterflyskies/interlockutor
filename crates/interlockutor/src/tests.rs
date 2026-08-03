@@ -920,6 +920,12 @@ fn the_scan_floor_never_skips_work_that_is_still_claimable() {
 }
 
 /// Fence-exhausted work is permanently unclaimable, so the floor crosses it too.
+///
+/// This builds the exhausted state directly, which is *not* the state the
+/// lifecycle produces: a real grant at the last fence leaves a lapsed `Leased`
+/// record behind, not an `Available` one. That path is covered by
+/// [`the_scan_floor_crosses_a_lapsed_lease_that_spent_the_last_fence`], and it
+/// is the one that was broken while this test passed.
 #[test]
 fn the_scan_floor_crosses_fence_exhausted_history() {
     let (store, _) = fixture();
@@ -941,6 +947,80 @@ fn the_scan_floor_crosses_fence_exhausted_history() {
         .expect("the later event is still claimable");
     assert_eq!(lease.event().id, claimable.id);
     assert_eq!(scan_floor_of(&store, &topic), 1);
+}
+
+/// Grant, expiry, exhaustion: the whole lifecycle, and the floor still crosses.
+///
+/// A lease really can be issued at `Fence(u64::MAX)`, and when it lapses without
+/// an acknowledgement or a release the item is unclaimable forever. Every later
+/// claim reported `FenceExhausted` correctly and left the phase as a lapsed
+/// `Leased` record, which is not terminal by inspection — so the floor could
+/// never cross it, and every claim on this topic re-examined it for the life of
+/// the store. That contradicts the amortized-`O(1)` guarantee the floor exists
+/// to provide, which is what makes this a defect rather than a cosmetic one.
+///
+/// The three claims below are the three phases. The assertion that fails
+/// without the fix is the last one: the floor moves past the dead item.
+#[test]
+fn the_scan_floor_crosses_a_lapsed_lease_that_spent_the_last_fence() {
+    let (store, clock) = fixture();
+    let topic = Topic("work".into());
+    let courier = ConsumerId("courier".into());
+    let doomed = append(&store, "a0", "work");
+    let claimable = append(&store, "a1", "work");
+    // One below the ceiling, so the next grant is the last fence there is.
+    store.state.lock().unwrap().work.insert(
+        doomed.id.clone(),
+        LeaseKernel::available_after(Fence(u64::MAX - 1)),
+    );
+
+    // 1. Grant. This is a real lease, not a synthetic state: the holder could
+    //    renew it, acknowledge it, or release it.
+    let last = store
+        .claim(&courier, &topic, Duration::from_millis(10))
+        .unwrap()
+        .expect("the item is claimable at the last fence");
+    assert_eq!(last.event().id, doomed.id);
+    assert_eq!(last.fence(), Fence(u64::MAX));
+    assert_eq!(scan_floor_of(&store, &topic), 0);
+
+    // 2. Expiry. The holder does neither, and the lease lapses.
+    clock.advance(10);
+    assert_eq!(store.ack_work(&last), Err(Error::LeaseExpired));
+
+    // 3. Exhaustion. The reclaim finds no fence left, so the item is skipped and
+    //    the scan moves on to work that is still claimable.
+    let next = store
+        .claim(&courier, &topic, Duration::from_millis(10))
+        .unwrap()
+        .expect("the later event is unaffected");
+    assert_eq!(next.event().id, claimable.id);
+
+    // The exhausted item is now terminal *as a phase*, so the next claim's floor
+    // pass crosses it instead of walking it again. Without that, the floor sticks
+    // at zero forever and this item is re-examined on every claim.
+    assert_eq!(
+        store
+            .claim_detailed(&ConsumerId("other".into()), &topic, Duration::from_secs(1))
+            .unwrap(),
+        ClaimOutcome::Contended {
+            event_id: claimable.id.clone(),
+            holder: courier.clone(),
+            expires_at: 20,
+        },
+        "the exhausted item is skipped; the live one is the contention"
+    );
+    assert_eq!(scan_floor_of(&store, &topic), 1);
+
+    // And it stays crossed: a stale owner of exhausted work is never disclosed.
+    store.ack_work(&next).unwrap();
+    assert_eq!(
+        store
+            .claim_detailed(&courier, &topic, Duration::from_secs(1))
+            .unwrap(),
+        ClaimOutcome::Empty
+    );
+    assert_eq!(scan_floor_of(&store, &topic), 2);
 }
 
 /// A panic in an injected `Clock::now` fail-stops the store as a typed error.
