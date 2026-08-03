@@ -197,6 +197,38 @@ pub struct Fence(pub u64);
 /// authenticated principal — rather than to whoever holds the token — must add
 /// that binding itself.
 ///
+/// # Cloning and transfer are deliberate, and the store is the arbiter
+///
+/// `Lease` is [`Clone`], and that is intentional rather than an oversight of
+/// the opacity work. Unconstructability stops a *non*-holder from manufacturing
+/// a token; it says nothing about what a legitimate holder may do with the one
+/// it was granted. Spelled out, because "unforgeable" is easy to misread as
+/// "unique":
+///
+/// - **Every clone is the same capability, not a copy of a lesser one.**
+///   Validation compares owner, fence, and canonical event. Clones are equal on
+///   all three, so any clone authorizes [`EventStore::renew`],
+///   [`EventStore::ack_work`], and [`EventStore::nack_work`] exactly as the
+///   original does. There is no per-token identity to distinguish them.
+/// - **Handing a clone to another component hands over the authority**, across
+///   threads or tasks included. That is the intended way to delegate work; it is
+///   also the whole risk, since the store cannot tell a delegate from the
+///   original holder.
+/// - **The store, not the token, decides when authority ends.** Terminal state
+///   lives in the store, so the *first* successful `ack_work` or `nack_work`
+///   consumes it and every outstanding clone — including the one the caller
+///   still holds — becomes stale. Subsequent mutations through any copy fail
+///   with [`Error::NotLeaseOwner`], never succeed twice. Cloning therefore
+///   cannot duplicate an effect through this crate; at-least-once redelivery
+///   still requires consumer effects to be idempotent.
+/// - **Expiry is likewise store-side.** Holding a clone past `expires_at`
+///   confers nothing: the item is reclaimable by anyone, and the reclaim issues
+///   a higher fence that invalidates every copy of the old token at once.
+///
+/// A backend that needs a lease to be non-transferable must bind mutations to an
+/// authenticated principal itself, as noted above. Removing `Clone` here would
+/// not achieve it — a holder can still pass the original by value.
+///
 /// # Forging a lease does not compile
 ///
 /// A losing claimant has the canonical event and the disclosed holder, and still
@@ -370,13 +402,31 @@ pub struct WorkAck {
 pub enum Error {
     Unauthorized,
     DuplicateEventId,
-    IdempotencyKeyConflict { key: IdempotencyKey },
-    OutOfOrderAck { expected: u64, actual: u64 },
+    IdempotencyKeyConflict {
+        key: IdempotencyKey,
+    },
+    OutOfOrderAck {
+        expected: u64,
+        actual: u64,
+    },
     UnknownEvent,
     NotLeaseOwner,
     StaleFence,
     LeaseExpired,
     InvalidLeaseDuration,
+    /// The store's internal lock was poisoned by a panic in an earlier
+    /// operation, and the store has fail-stopped.
+    ///
+    /// The realistic source is an injected [`Clock`]: [`MemoryStore`] samples
+    /// its clock *while holding the state lock*, so a panicking `now` poisons
+    /// the store. [`MemoryStore::with_clock`] is a public seam, which makes this
+    /// a foreseeable input rather than a corruption event.
+    ///
+    /// This is permanent and deliberate. Once poisoned the store never recovers;
+    /// every later operation returns this error. See [`MemoryStore`] for why
+    /// this is reported rather than panicked, and why recovery is not offered
+    /// even though the reference store's invariants do in fact survive.
+    StorePoisoned,
 }
 
 impl fmt::Display for Error {
@@ -398,6 +448,9 @@ impl fmt::Display for Error {
             Self::InvalidLeaseDuration => f.write_str(
                 "lease duration must be at least one millisecond and produce a representable expiration",
             ),
+            Self::StorePoisoned => {
+                f.write_str("store is poisoned by an earlier panic and has fail-stopped")
+            }
         }
     }
 }
@@ -629,6 +682,35 @@ impl<T: EventStore + ?Sized> EventStoreExt for T {
     }
 }
 
+/// Process-local reference store.
+///
+/// # A panicking [`Clock`] fail-stops the store, as an error
+///
+/// This store samples its clock while holding the state lock, so a panic inside
+/// an injected `Clock::now` poisons that lock. Every later operation then
+/// reports [`Error::StorePoisoned`] instead of panicking at the lock.
+///
+/// Returning an error is chosen over the two alternatives on purpose.
+///
+/// - **Over panicking**, because these methods return [`Result`]. A caller that
+///   handles every documented error still had its thread unwound by an
+///   `expect` on the lock — an undocumented panic in a fallible API, and one a
+///   library has no business inflicting on a caller's process because an
+///   injected clock misbehaved. `Clock` is a public seam
+///   ([`MemoryStore::with_clock`]), so a misbehaving implementation is a
+///   foreseeable input.
+/// - **Over recovering** with `PoisonError::into_inner`, even though the
+///   reference store's invariants genuinely do survive: every clock sample is
+///   taken either before any mutation in that critical section, or after a
+///   mutation that had already completed consistently. Recovery is still not
+///   offered, because that reasoning is a property of *this* implementation's
+///   current statement order, not of the [`EventStore`] contract. Silently
+///   continuing would bake a fragile audit into the API, and a later edit that
+///   moved a clock sample between two mutations would turn it false with no
+///   signal. Fail-stop is the honest boundary.
+///
+/// Poisoning is therefore permanent: the store never un-poisons, and there is no
+/// reset. The failure is loud, typed, and terminal rather than silent.
 #[derive(Clone)]
 pub struct MemoryStore {
     clock: Arc<dyn Clock>,
@@ -643,6 +725,13 @@ struct State {
     event_ids: HashMap<EventId, IdempotencyKey>,
     cursors: HashMap<(ConsumerId, Topic), u64>,
     work: HashMap<EventId, LeaseKernel<ConsumerId>>,
+    /// Per-topic index of the first event that is not *permanently* terminal.
+    ///
+    /// Everything below this index is acknowledged or fence-exhausted, so it can
+    /// never yield a grant or a holder again. Claiming starts here instead of at
+    /// sequence one, which is what stops a topic's finished history from being
+    /// rescanned on every claim. See [`MemoryStore::claim_detailed`].
+    scan_floor: HashMap<Topic, usize>,
 }
 
 impl MemoryStore {
@@ -658,6 +747,13 @@ impl MemoryStore {
             authorizer,
             state: Arc::new(Mutex::new(State::default())),
         }
+    }
+
+    /// Locks the state, reporting poisoning instead of panicking.
+    ///
+    /// See the type-level note: poisoning is a permanent, deliberate fail-stop.
+    fn lock(&self) -> Result<std::sync::MutexGuard<'_, State>, Error> {
+        self.state.lock().map_err(|_| Error::StorePoisoned)
     }
 
     fn expiry_from(now: Timestamp, duration: Duration) -> Result<Timestamp, Error> {
@@ -692,7 +788,7 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_publish(producer, &event.topic) {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let mut state = self.lock()?;
         if let Some(existing) = state.idempotency.get(&event.idempotency_key) {
             if classify_replay(
                 (&existing.id, &existing.topic, &existing.payload),
@@ -744,7 +840,7 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
-        let state = self.state.lock().expect("memory store mutex poisoned");
+        let state = self.lock()?;
         let cursor = state
             .cursors
             .get(&(consumer.clone(), topic.clone()))
@@ -770,12 +866,15 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
-        let exists = state
-            .topics
-            .get(topic)
-            .is_some_and(|events| events.iter().any(|e| e.sequence == sequence));
-        if !exists {
+        let mut state = self.lock()?;
+        // `append` assigns `len + 1` and pushes, so a topic's sequences are
+        // exactly `1..=len`, contiguous and in order. Existence is therefore a
+        // bounds check, not a search: the previous linear scan walked the whole
+        // topic on every broadcast acknowledgement, which made draining a topic
+        // quadratic in its length for no information the length did not already
+        // carry.
+        let length = state.topics.get(topic).map_or(0, Vec::len) as u64;
+        if sequence == 0 || sequence > length {
             return Err(Error::UnknownEvent);
         }
         let cursor = state
@@ -807,16 +906,46 @@ impl EventStore for MemoryStore {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let mut guard = self.lock()?;
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
-        let events = state.topics.get(topic).cloned().unwrap_or_default();
+
+        // Borrow the three fields the scan touches separately. The previous
+        // version cloned the entire topic — every `Event`, and so every
+        // `Payload` — on every claim, purely to dodge a borrow conflict between
+        // `topics` (shared) and `work` (mutable). Destructuring gives disjoint
+        // field borrows instead, so the scan reads events in place and exactly
+        // one `Event` is cloned: the one actually granted.
+        let State {
+            topics,
+            work,
+            scan_floor,
+            ..
+        } = &mut *guard;
+        let Some(events) = topics.get(topic) else {
+            return Ok(ClaimOutcome::Empty);
+        };
+
+        // Advance past the contiguous prefix of permanently terminal work.
+        // Acknowledged and fence-exhausted items can never yield a grant or a
+        // holder, so skipping them is invisible to the outcome — but rescanning
+        // them was what made a drained topic cost O(N) per claim, and O(N^2) to
+        // drain. Each index is stepped over at most once in the store's
+        // lifetime, so this loop is amortized O(1) per claim.
+        let floor = scan_floor.entry(topic.clone()).or_insert(0);
+        while *floor < events.len()
+            && work
+                .get(&events[*floor].id)
+                .is_some_and(LeaseKernel::is_permanently_terminal)
+        {
+            *floor += 1;
+        }
+
         // Remembers the earliest live-contended item while the scan keeps
         // looking for an outright grant. Available work must beat contention.
         let mut contended = None;
-        for event in events {
-            let work = state
-                .work
+        for event in &events[*floor..] {
+            let work = work
                 .get_mut(&event.id)
                 .expect("work state exists for event");
             let outcome = work.claim(consumer.clone(), now, expires_at);
@@ -834,7 +963,7 @@ impl EventStore for MemoryStore {
             }
             if let Some(lease) = outcome.granted() {
                 return Ok(ClaimOutcome::Granted(Lease {
-                    event,
+                    event: event.clone(),
                     owner: lease.owner,
                     fence: lease.fence,
                     expires_at: lease.expires_at,
@@ -851,7 +980,7 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let mut state = self.lock()?;
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
         Self::validate_lease(&state, lease, now)?;
@@ -876,7 +1005,7 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let mut state = self.lock()?;
         let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         state
@@ -900,7 +1029,7 @@ impl EventStore for MemoryStore {
         {
             return Err(Error::Unauthorized);
         }
-        let mut state = self.state.lock().expect("memory store mutex poisoned");
+        let mut state = self.lock()?;
         let now = self.clock.now();
         Self::validate_lease(&state, lease, now)?;
         state

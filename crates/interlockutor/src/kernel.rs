@@ -173,6 +173,29 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
         Ok(())
     }
 
+    /// True only for states that can never again yield a grant *or* a holder,
+    /// whatever the current time.
+    ///
+    /// This is the predicate the store's per-topic scan floor advances over, so
+    /// it must be time-independent: a floor is permanent, and an item that is
+    /// merely uninteresting *right now* must not be skipped forever.
+    ///
+    /// - `Acknowledged` is terminal by construction.
+    /// - `Available` with the last fence issued can never be leased again, since
+    ///   the next fence would have to wrap.
+    /// - `Leased` is deliberately excluded, **including** the fence-exhausted
+    ///   case. A live lease is a holder that must still be reported as
+    ///   contention, and an expired one only becomes terminal as time passes.
+    ///   Being conservative here costs at most a re-examined item per claim and
+    ///   keeps the predicate independent of `now`.
+    pub(super) fn is_permanently_terminal(&self) -> bool {
+        match &self.phase {
+            Phase::Acknowledged => true,
+            Phase::Available => self.last_issued.0 == u64::MAX,
+            Phase::Leased(_) => false,
+        }
+    }
+
     pub(super) fn validate(
         &self,
         owner: &Owner,

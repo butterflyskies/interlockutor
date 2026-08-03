@@ -824,3 +824,204 @@ fn claim_detailed_respects_authorization_before_disclosing_a_holder() {
         Err(Error::Unauthorized)
     );
 }
+
+fn scan_floor_of(store: &MemoryStore, topic: &Topic) -> usize {
+    store
+        .state
+        .lock()
+        .expect("fixture store is not poisoned")
+        .scan_floor
+        .get(topic)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// Draining a topic must not rescan the history it already finished.
+///
+/// This is the observable half of the claim-scan complexity fix. Before it, each
+/// claim walked the topic from sequence one, so acknowledged work was re-examined
+/// on every subsequent claim and draining N events cost O(N^2) kernel
+/// transitions. The floor makes the acknowledged prefix cost O(1) per claim,
+/// amortized, and it is asserted directly here rather than inferred from timing.
+#[test]
+fn draining_a_topic_advances_the_scan_floor_past_acknowledged_history() {
+    const EVENTS: usize = 8;
+    let (store, _) = fixture();
+    let topic = Topic("work".into());
+    let consumer = ConsumerId("courier".into());
+    for i in 0..EVENTS {
+        append(&store, &format!("a{i}"), "work");
+    }
+    assert_eq!(scan_floor_of(&store, &topic), 0);
+
+    for i in 0..EVENTS {
+        let lease = store
+            .claim(&consumer, &topic, Duration::from_secs(1))
+            .unwrap()
+            .expect("each event in turn is claimable");
+        assert_eq!(lease.event().sequence as usize, i + 1);
+        store.ack_work(&lease).unwrap();
+        assert_eq!(scan_floor_of(&store, &topic), i, "floor after claim {i}");
+    }
+
+    // The drained topic is empty, and the next claim starts past every event
+    // rather than walking all of them to discover that.
+    assert_eq!(
+        store
+            .claim_detailed(&consumer, &topic, Duration::from_secs(1))
+            .unwrap(),
+        ClaimOutcome::Empty
+    );
+    assert_eq!(scan_floor_of(&store, &topic), EVENTS);
+}
+
+/// The floor may only cross a *contiguous* terminal prefix.
+///
+/// Work completes out of order in practice. If the floor advanced past any
+/// terminal item rather than a contiguous run of them, an earlier claimable
+/// event would be skipped forever — the fix would have changed behaviour, which
+/// it must not.
+#[test]
+fn the_scan_floor_never_skips_work_that_is_still_claimable() {
+    let (store, _) = fixture();
+    let topic = Topic("work".into());
+    let consumer = ConsumerId("courier".into());
+    for i in 0..3 {
+        append(&store, &format!("a{i}"), "work");
+    }
+
+    let first = store
+        .claim(&consumer, &topic, Duration::from_secs(1))
+        .unwrap()
+        .expect("a0 is claimable");
+    assert_eq!(first.event().sequence, 1);
+    let second = store
+        .claim(&consumer, &topic, Duration::from_secs(1))
+        .unwrap()
+        .expect("a1 is claimable while a0 is held");
+    assert_eq!(second.event().sequence, 2);
+
+    // A later event finishes while an earlier one is still live.
+    store.ack_work(&second).unwrap();
+    assert_eq!(
+        scan_floor_of(&store, &topic),
+        0,
+        "a terminal item behind a live one must not move the floor"
+    );
+
+    // The earlier event returns to the queue and is still granted, in order.
+    store.nack_work(&first).unwrap();
+    let requeued = store
+        .claim(&consumer, &topic, Duration::from_secs(1))
+        .unwrap()
+        .expect("the released event is claimable again");
+    assert_eq!(requeued.event().sequence, 1);
+    assert_eq!(scan_floor_of(&store, &topic), 0);
+}
+
+/// Fence-exhausted work is permanently unclaimable, so the floor crosses it too.
+#[test]
+fn the_scan_floor_crosses_fence_exhausted_history() {
+    let (store, _) = fixture();
+    let topic = Topic("work".into());
+    let exhausted = append(&store, "a0", "work");
+    let claimable = append(&store, "a1", "work");
+    store.state.lock().unwrap().work.insert(
+        exhausted.id.clone(),
+        LeaseKernel::available_after(Fence(u64::MAX)),
+    );
+
+    let lease = store
+        .claim(
+            &ConsumerId("courier".into()),
+            &topic,
+            Duration::from_secs(1),
+        )
+        .unwrap()
+        .expect("the later event is still claimable");
+    assert_eq!(lease.event().id, claimable.id);
+    assert_eq!(scan_floor_of(&store, &topic), 1);
+}
+
+/// A panic in an injected `Clock::now` fail-stops the store as a typed error.
+///
+/// The store samples its clock under the state lock, so a panicking clock
+/// poisons that lock. Every `Result`-returning operation used to panic at
+/// `lock().expect(..)` instead of reporting anything — an undocumented panic in
+/// a fallible API, reachable through the public `with_clock` seam.
+///
+/// One panic is expected on stderr while this test runs: it is the injected one,
+/// caught below.
+#[test]
+fn a_panicking_clock_fail_stops_the_store_as_an_error_not_a_panic() {
+    struct PanickingClock {
+        armed: AtomicBool,
+    }
+    impl Clock for PanickingClock {
+        fn now(&self) -> Timestamp {
+            assert!(
+                !self.armed.load(Ordering::SeqCst),
+                "injected clock panic, under the state lock"
+            );
+            0
+        }
+    }
+
+    let clock = Arc::new(PanickingClock {
+        armed: AtomicBool::new(false),
+    });
+    let store = MemoryStore::with_clock(clock.clone(), Arc::new(AllowAll));
+    let topic = Topic("work".into());
+    let consumer = ConsumerId("courier".into());
+    append(&store, "a0", "work");
+    let lease = store
+        .claim(&consumer, &topic, Duration::from_secs(1))
+        .unwrap()
+        .expect("the event is claimable before the clock misbehaves");
+
+    clock.armed.store(true, Ordering::SeqCst);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = store.append("producer", new("a1", "work"));
+    }));
+    assert!(
+        unwound.is_err(),
+        "the armed clock must panic under the lock"
+    );
+
+    // Every operation now reports the fail-stop rather than panicking at the
+    // lock, including the ones that never touch the clock at all.
+    assert_eq!(
+        store.append("producer", new("a2", "work")),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(
+        store.read_broadcast(&consumer, &topic, 10),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(
+        store.ack_broadcast(&consumer, &topic, 1),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(
+        store.claim_detailed(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(
+        store.claim(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(
+        store.renew(&lease, Duration::from_secs(1)),
+        Err(Error::StorePoisoned)
+    );
+    assert_eq!(store.ack_work(&lease), Err(Error::StorePoisoned));
+    assert_eq!(store.nack_work(&lease), Err(Error::StorePoisoned));
+
+    // Poisoning is permanent. Repairing the clock does not repair the store.
+    clock.armed.store(false, Ordering::SeqCst);
+    assert_eq!(store.ack_work(&lease), Err(Error::StorePoisoned));
+    assert_eq!(
+        store.claim(&consumer, &topic, Duration::from_secs(1)),
+        Err(Error::StorePoisoned)
+    );
+}
