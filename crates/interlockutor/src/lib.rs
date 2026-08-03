@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 mod kernel;
 
-use kernel::{Claim, LeaseError, LeaseKernel, Replay, classify_replay};
+use kernel::{LeaseError, LeaseKernel, Replay, classify_replay};
 
 /// Monotonic time in milliseconds from an implementation-defined epoch.
 pub type Timestamp = u64;
@@ -160,6 +160,83 @@ pub struct Lease {
     pub expires_at: Timestamp,
 }
 
+/// The detailed outcome of one claim attempt.
+///
+/// This is the protocol contract for claiming. [`EventStore::claim`] is a lossy
+/// projection of it, kept for compatibility; new consumers should match on this
+/// type so a losing claimant can distinguish "someone else holds this right
+/// now" from "there is nothing to do".
+///
+/// # Holder disclosure is deliberate
+///
+/// [`ClaimOutcome::Contended`] reveals the current lease owner's identity to
+/// any caller that can attempt a claim on the topic. This is a chosen exposure,
+/// not an oversight. It is appropriate for the in-process, mutually-trusting
+/// consumer model the reference [`MemoryStore`] serves, where naming the holder
+/// is what turns a blind retry into a scheduled one.
+///
+/// It becomes an enumeration and reconnaissance surface the moment a durable or
+/// networked backend serves mutually-distrusting claimants: such an attacker can
+/// attempt claims repeatedly to map who-holds-what. A backend with that threat
+/// model must gate or redact `Contended` behind its own policy — the core
+/// [`Authorizer`] seam only decides whether a consumer may claim the topic at
+/// all, not what it may learn about other consumers. To keep the exposure as
+/// small as the contract allows, a contended outcome names exactly one holder
+/// — the lowest-sequence live-contended event — never the full contention set.
+///
+/// # `holder` is a coordination identifier, not a credential
+///
+/// Possessing another consumer's [`ConsumerId`] confers no authority whatsoever.
+/// Every lease mutation is gated by an exact match on both the active fencing
+/// token and the recorded owner, so a disclosed holder cannot be replayed to
+/// renew, acknowledge, release, or steal that lease. Future backend authors must
+/// not read holder disclosure as "here is a token you can use": it is data for
+/// scheduling and diagnostics, and nothing else.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ClaimOutcome {
+    /// The caller now holds the lease described here.
+    Granted(Lease),
+    /// Nothing was claimable, and live work is held by another consumer.
+    ///
+    /// Reported only for work that is *currently leased and unexpired*.
+    /// Acknowledged work and fence-exhausted work have no current holder and are
+    /// never reported here, so a stale owner of finished work is never named.
+    ///
+    /// When several earlier events are concurrently leased, this names the one
+    /// with the **lowest sequence within the topic**. [`EventStore::claim`] does
+    /// not name an [`EventId`], so the choice is fixed by scan order to keep the
+    /// outcome deterministic.
+    Contended {
+        /// The contended event.
+        event_id: EventId,
+        /// The consumer currently holding the lease. See the type-level note:
+        /// this is an identifier, not a credential.
+        holder: ConsumerId,
+        /// The holder's active fencing token; higher means more recent.
+        fence: Fence,
+        /// When the holder's lease lapses, after which reclaim can succeed.
+        /// This is what makes a scheduled retry possible instead of a blind one.
+        expires_at: Timestamp,
+    },
+    /// The topic has no claimable work and no live-contended work.
+    Empty,
+}
+
+impl ClaimOutcome {
+    /// Projects onto the lossy [`EventStore::claim`] shape.
+    ///
+    /// `Granted` becomes `Some`; `Contended` and `Empty` both collapse to
+    /// `None`. This is the single definition of that projection, so
+    /// `store.claim(..) == store.claim_detailed(..).granted()` holds by
+    /// construction rather than by two implementations agreeing.
+    pub fn granted(self) -> Option<Lease> {
+        match self {
+            Self::Granted(lease) => Some(lease),
+            Self::Contended { .. } | Self::Empty => None,
+        }
+    }
+}
+
 /// Final acknowledgement of work under a current lease.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkAck {
@@ -287,19 +364,50 @@ pub trait EventStore: Send + Sync {
         sequence: u64,
     ) -> Result<BroadcastAck, Error>;
 
-    /// Claims the first available event.
+    /// Claims the first available event, reporting contention when there is none.
+    ///
+    /// This is the claim protocol contract. Implementations must compute the
+    /// outcome once, under whatever single critical section guards their state.
+    ///
+    /// Available work always wins: the scan looks for a grant across the whole
+    /// topic first, so later claimable work is preferred over an earlier event
+    /// that merely happens to be leased. Only when no grant exists does this
+    /// report [`ClaimOutcome::Contended`], naming the lowest-sequence event that
+    /// is *currently* leased and unexpired. Acknowledged and fence-exhausted
+    /// items are skipped and are never reported as contention.
     ///
     /// Durations are measured in whole milliseconds. Durations below one
     /// millisecond, durations outside the timestamp domain, and unrepresentable
     /// expiration times are rejected as [`Error::InvalidLeaseDuration`]. If an
     /// item's `u64` fencing-token space is exhausted, that item remains
     /// permanently unavailable and the search continues with later events.
+    fn claim_detailed(
+        &self,
+        consumer: &ConsumerId,
+        topic: &Topic,
+        lease_for: Duration,
+    ) -> Result<ClaimOutcome, Error>;
+
+    /// Claims the first available event, discarding why a claim failed.
+    ///
+    /// This is the **lossy compatibility surface, not the protocol contract**.
+    /// `Ok(None)` collapses "another consumer holds this right now" together
+    /// with "there is nothing to do", so a losing claimant cannot tell them
+    /// apart or learn when to come back. New consumers should call
+    /// [`EventStore::claim_detailed`] instead.
+    ///
+    /// Do not override this. It is a projection of the single authoritative
+    /// result computed by [`EventStore::claim_detailed`]; a second
+    /// implementation would be a correctness hazard, because the two paths could
+    /// take separate locks and observe different states.
     fn claim(
         &self,
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<Option<Lease>, Error>;
+    ) -> Result<Option<Lease>, Error> {
+        Ok(self.claim_detailed(consumer, topic, lease_for)?.granted())
+    }
 
     /// Renews a current lease without changing its owner or fence.
     ///
@@ -490,12 +598,12 @@ impl EventStore for MemoryStore {
         })
     }
 
-    fn claim(
+    fn claim_detailed(
         &self,
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<Option<Lease>, Error> {
+    ) -> Result<ClaimOutcome, Error> {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }
@@ -503,24 +611,36 @@ impl EventStore for MemoryStore {
         let now = self.clock.now();
         let expires_at = Self::expiry_from(now, lease_for)?;
         let events = state.topics.get(topic).cloned().unwrap_or_default();
+        // Remembers the earliest live-contended item while the scan keeps
+        // looking for an outright grant. Available work must beat contention.
+        let mut contended = None;
         for event in events {
             let work = state
                 .work
                 .get_mut(&event.id)
                 .expect("work state exists for event");
-            match work.claim(consumer.clone(), now, expires_at) {
-                Claim::Granted(lease) => {
-                    return Ok(Some(Lease {
-                        event,
-                        owner: lease.owner,
-                        fence: lease.fence,
-                        expires_at: lease.expires_at,
-                    }));
-                }
-                Claim::Unavailable | Claim::FenceExhausted => continue,
+            let outcome = work.claim(consumer.clone(), now, expires_at);
+            // Terminal and fence-exhausted items yield neither a grant nor a
+            // holder, so they fall through both arms and are simply skipped.
+            if let Some(holder) = outcome.contended() {
+                contended.get_or_insert_with(|| ClaimOutcome::Contended {
+                    event_id: event.id.clone(),
+                    holder: holder.owner.clone(),
+                    fence: holder.fence,
+                    expires_at: holder.expires_at,
+                });
+                continue;
+            }
+            if let Some(lease) = outcome.granted() {
+                return Ok(ClaimOutcome::Granted(Lease {
+                    event,
+                    owner: lease.owner,
+                    fence: lease.fence,
+                    expires_at: lease.expires_at,
+                }));
             }
         }
-        Ok(None)
+        Ok(contended.unwrap_or(ClaimOutcome::Empty))
     }
 
     fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error> {

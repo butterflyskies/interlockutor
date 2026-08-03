@@ -47,12 +47,50 @@ impl<Owner> LeaseKernel<Owner> {
     }
 }
 
+/// The authoritative outcome of one attempted transition on a single item.
+///
+/// `Occupied` and `Terminal` were a single `Unavailable` variant before the
+/// contended-claim work. They are kept apart because they mean different
+/// things to a losing claimant: `Occupied` names a live holder worth waiting
+/// for, while `Terminal` and `FenceExhausted` name work that will never be
+/// claimable again. Collapsing them is what made it impossible to report a
+/// current holder without also reporting stale owners of finished work.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum Claim<Owner> {
     Granted(LeaseRecord<Owner>),
-    Unavailable,
+    /// A live, unexpired lease is held; the record describes the current holder.
+    Occupied(LeaseRecord<Owner>),
+    /// Work was acknowledged. There is no current holder and never will be.
+    Terminal,
     /// The last fence was `u64::MAX`; this item can never be leased again.
     FenceExhausted,
+}
+
+impl<Owner> Claim<Owner> {
+    /// Projects the detailed outcome onto the historical `Option`-shaped one.
+    ///
+    /// This is the single definition of the lossy public [`crate::EventStore::claim`]
+    /// surface: it exists so there is exactly one authoritative computation and
+    /// one projection of it, never two claim implementations that can diverge.
+    pub(super) fn granted(self) -> Option<LeaseRecord<Owner>> {
+        match self {
+            Self::Granted(lease) => Some(lease),
+            Self::Occupied(_) | Self::Terminal | Self::FenceExhausted => None,
+        }
+    }
+
+    /// Borrows the current holder, if and only if this item is live-contended.
+    ///
+    /// Acknowledged and fence-exhausted work has no current holder. Reporting
+    /// the stale owner of finished work as a holder would be a lie the type
+    /// system endorsed, so those cases are `None` by construction here rather
+    /// than by discipline at each call site.
+    pub(super) fn contended(&self) -> Option<&LeaseRecord<Owner>> {
+        match self {
+            Self::Occupied(lease) => Some(lease),
+            Self::Granted(_) | Self::Terminal | Self::FenceExhausted => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,8 +111,10 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
         debug_assert!(expires_at > now, "a new lease must expire in the future");
 
         match &self.phase {
-            Phase::Acknowledged => return Claim::Unavailable,
-            Phase::Leased(lease) if lease.expires_at > now => return Claim::Unavailable,
+            Phase::Acknowledged => return Claim::Terminal,
+            Phase::Leased(lease) if lease.expires_at > now => {
+                return Claim::Occupied(lease.clone());
+            }
             Phase::Available | Phase::Leased(_) => {}
         }
 
@@ -201,13 +241,13 @@ mod proofs {
             Claim::Granted(lease) => {
                 assert!(previous_fence < u64::MAX);
                 assert_eq!(lease.fence.0, previous_fence + 1);
-                assert_eq!(kernel.claim(2, 0, 1), Claim::Unavailable);
+                assert_eq!(kernel.claim(2, 0, 1), Claim::Occupied(lease));
             }
             Claim::FenceExhausted => {
                 assert_eq!(previous_fence, u64::MAX);
                 assert_eq!(kernel, before);
             }
-            Claim::Unavailable => unreachable!(),
+            Claim::Occupied(_) | Claim::Terminal => unreachable!(),
         }
     }
 
@@ -358,12 +398,127 @@ mod proofs {
 
         assert_eq!(kernel.acknowledge(&1, lease.fence, 0), Ok(()));
         let acknowledged = kernel.clone();
-        assert_eq!(kernel.claim(2, 1, 2), Claim::Unavailable);
+        assert_eq!(kernel.claim(2, 1, 2), Claim::Terminal);
         assert_eq!(
             kernel.acknowledge(&1, lease.fence, 0),
             Err(LeaseError::NotLeased)
         );
         assert_eq!(kernel, acknowledged);
+    }
+
+    /// Builds a kernel in any reachable phase, relative to `now`.
+    fn any_kernel(now: Timestamp) -> LeaseKernel<u8> {
+        let last_issued = Fence(kani::any::<u64>());
+        let expires_at = kani::any::<u64>();
+        let phase = match kani::any::<u8>() % 4 {
+            0 => Phase::Available,
+            1 => Phase::Acknowledged,
+            2 => {
+                kani::assume(expires_at > now);
+                Phase::Leased(LeaseRecord {
+                    owner: kani::any::<u8>(),
+                    fence: last_issued,
+                    expires_at,
+                })
+            }
+            _ => {
+                kani::assume(expires_at <= now);
+                Phase::Leased(LeaseRecord {
+                    owner: kani::any::<u8>(),
+                    fence: last_issued,
+                    expires_at,
+                })
+            }
+        };
+        LeaseKernel { last_issued, phase }
+    }
+
+    #[kani::proof]
+    fn contention_reports_the_exact_live_holder_without_mutation() {
+        let now = kani::any::<u64>();
+        kani::assume(now < u64::MAX);
+        let expires_at = kani::any::<u64>();
+        kani::assume(expires_at > now);
+        let fence = Fence(kani::any::<u64>());
+
+        let mut kernel = LeaseKernel {
+            last_issued: fence,
+            phase: Phase::Leased(LeaseRecord {
+                owner: 1_u8,
+                fence,
+                expires_at,
+            }),
+        };
+        let before = kernel.clone();
+
+        let outcome = kernel.claim(2_u8, now, now + 1);
+        let holder = outcome.contended().expect("a live lease is contention");
+        assert_eq!(holder.owner, 1);
+        assert_eq!(holder.fence, fence);
+        assert_eq!(holder.expires_at, expires_at);
+        assert!(outcome.granted().is_none());
+        assert_eq!(kernel, before);
+    }
+
+    #[kani::proof]
+    fn terminal_and_exhausted_are_never_reported_as_contention() {
+        let now = kani::any::<u64>();
+        kani::assume(now < u64::MAX);
+
+        let mut acknowledged = LeaseKernel::<u8> {
+            last_issued: Fence(kani::any::<u64>()),
+            phase: Phase::Acknowledged,
+        };
+        let before = acknowledged.clone();
+        let outcome = acknowledged.claim(3, now, now + 1);
+        assert_eq!(outcome, Claim::Terminal);
+        assert!(outcome.contended().is_none());
+        assert!(outcome.granted().is_none());
+        assert_eq!(acknowledged, before);
+
+        let mut exhausted = LeaseKernel::<u8> {
+            last_issued: Fence(u64::MAX),
+            phase: Phase::Available,
+        };
+        let before = exhausted.clone();
+        let outcome = exhausted.claim(3, now, now + 1);
+        assert_eq!(outcome, Claim::FenceExhausted);
+        assert!(outcome.contended().is_none());
+        assert!(outcome.granted().is_none());
+        assert_eq!(exhausted, before);
+
+        // Exhaustion whose record still names the stale owner of expired work.
+        // That owner is not a current holder and must never be disclosed as one.
+        let stale_expiry = kani::any::<u64>();
+        kani::assume(stale_expiry <= now);
+        let mut exhausted_with_stale_owner = LeaseKernel {
+            last_issued: Fence(u64::MAX),
+            phase: Phase::Leased(LeaseRecord {
+                owner: 7_u8,
+                fence: Fence(u64::MAX),
+                expires_at: stale_expiry,
+            }),
+        };
+        let before = exhausted_with_stale_owner.clone();
+        let outcome = exhausted_with_stale_owner.claim(3, now, now + 1);
+        assert_eq!(outcome, Claim::FenceExhausted);
+        assert!(outcome.contended().is_none());
+        assert!(outcome.granted().is_none());
+        assert_eq!(exhausted_with_stale_owner, before);
+    }
+
+    /// The kernel-level shadow of the store's `claim == claim_detailed.granted()`
+    /// compatibility invariant: one authoritative outcome, one lossy projection.
+    #[kani::proof]
+    fn granted_projection_agrees_with_the_detailed_outcome() {
+        let now = kani::any::<u64>();
+        kani::assume(now < u64::MAX);
+        let mut kernel = any_kernel(now);
+
+        let outcome = kernel.claim(9_u8, now, now + 1);
+        let was_granted = matches!(outcome, Claim::Granted(_));
+        assert!(!(was_granted && outcome.contended().is_some()));
+        assert_eq!(outcome.granted().is_some(), was_granted);
     }
 
     #[kani::proof]

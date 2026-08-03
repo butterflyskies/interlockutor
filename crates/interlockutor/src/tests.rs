@@ -630,3 +630,191 @@ fn lease_event_cannot_be_forged_to_change_its_topic() {
     lease.event.topic = Topic("different".into());
     assert_eq!(store.ack_work(&lease), Err(Error::UnknownEvent));
 }
+
+fn contention_fixture(scenario: &str) -> MemoryStore {
+    let (store, _clock) = fixture();
+    let topic = Topic("work".into());
+    let hold = |name: &str| {
+        store
+            .claim(&ConsumerId(name.into()), &topic, Duration::from_secs(1))
+            .unwrap()
+            .expect("fixture expects claimable work")
+    };
+    match scenario {
+        "empty" => {}
+        "available" => {
+            append(&store, "a", "work");
+        }
+        "contended" => {
+            append(&store, "a", "work");
+            hold("holder");
+        }
+        "acknowledged" => {
+            append(&store, "a", "work");
+            let lease = hold("holder");
+            store.ack_work(&lease).unwrap();
+        }
+        "contention_then_available" => {
+            append(&store, "a", "work");
+            append(&store, "b", "work");
+            hold("holder");
+        }
+        "all_contended" => {
+            for id in ["a", "b", "c"] {
+                append(&store, id, "work");
+            }
+            hold("holder-a");
+            hold("holder-b");
+            hold("holder-c");
+        }
+        other => panic!("unknown scenario {other}"),
+    }
+    store
+}
+
+fn probe(store: &MemoryStore) -> ClaimOutcome {
+    store
+        .claim_detailed(
+            &ConsumerId("probe".into()),
+            &Topic("work".into()),
+            Duration::from_secs(1),
+        )
+        .unwrap()
+}
+
+#[test]
+fn contention_names_the_current_holder_fence_and_expiry() {
+    let store = contention_fixture("contended");
+    let held = ClaimOutcome::Contended {
+        event_id: EventId("a".into()),
+        holder: ConsumerId("holder".into()),
+        fence: Fence(1),
+        expires_at: 1000,
+    };
+    assert_eq!(probe(&store), held);
+    // Reporting contention must not mutate: the same probe repeats verbatim,
+    // and the holder's own lease is untouched.
+    assert_eq!(probe(&store), held);
+    assert_eq!(
+        store
+            .claim(
+                &ConsumerId("probe".into()),
+                &Topic("work".into()),
+                Duration::from_secs(1)
+            )
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn later_available_work_beats_earlier_contention() {
+    let store = contention_fixture("contention_then_available");
+    let ClaimOutcome::Granted(lease) = probe(&store) else {
+        panic!("available work must win over an earlier contended event");
+    };
+    assert_eq!(lease.event.id, EventId("b".into()));
+    assert_eq!(lease.owner, ConsumerId("probe".into()));
+}
+
+#[test]
+fn contention_names_the_lowest_sequence_holder() {
+    let store = contention_fixture("all_contended");
+    // `claim` does not name an event, so the disclosed holder is fixed by scan
+    // order: the earliest contended event, and only that one.
+    assert_eq!(
+        probe(&store),
+        ClaimOutcome::Contended {
+            event_id: EventId("a".into()),
+            holder: ConsumerId("holder-a".into()),
+            fence: Fence(1),
+            expires_at: 1000,
+        }
+    );
+}
+
+#[test]
+fn acknowledged_work_is_empty_rather_than_contended() {
+    // Terminal work has no current holder; naming its stale owner would be a lie.
+    assert_eq!(
+        probe(&contention_fixture("acknowledged")),
+        ClaimOutcome::Empty
+    );
+    assert_eq!(probe(&contention_fixture("empty")), ClaimOutcome::Empty);
+}
+
+#[test]
+fn expired_holder_is_reclaimed_rather_than_reported_as_contention() {
+    let (store, clock) = fixture();
+    append(&store, "a", "work");
+    let topic = Topic("work".into());
+    store
+        .claim(
+            &ConsumerId("holder".into()),
+            &topic,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .unwrap();
+    clock.set(10);
+    let ClaimOutcome::Granted(lease) = probe(&store) else {
+        panic!("an expired holder is not contention");
+    };
+    assert_eq!(lease.owner, ConsumerId("probe".into()));
+    assert_eq!(lease.fence, Fence(2));
+}
+
+/// `claim` must equal the projection of `claim_detailed` in the same state.
+///
+/// Two identically-built stores are used because both calls mutate. This is the
+/// compatibility invariant that keeps the legacy `Option<Lease>` surface, and
+/// oracles written against it, meaningful after the outcome type widened.
+#[test]
+fn legacy_claim_equals_the_detailed_projection() {
+    for scenario in [
+        "empty",
+        "available",
+        "contended",
+        "acknowledged",
+        "contention_then_available",
+        "all_contended",
+    ] {
+        let legacy = contention_fixture(scenario);
+        let detailed = contention_fixture(scenario);
+        let consumer = ConsumerId("probe".into());
+        let topic = Topic("work".into());
+        assert_eq!(
+            legacy
+                .claim(&consumer, &topic, Duration::from_secs(1))
+                .unwrap(),
+            detailed
+                .claim_detailed(&consumer, &topic, Duration::from_secs(1))
+                .unwrap()
+                .granted(),
+            "scenario {scenario}"
+        );
+    }
+}
+
+#[test]
+fn claim_detailed_respects_authorization_before_disclosing_a_holder() {
+    struct DenyConsume;
+    impl Authorizer for DenyConsume {
+        fn can_publish(&self, _: &str, _: &Topic) -> bool {
+            true
+        }
+        fn can_consume(&self, _: &ConsumerId, _: &Topic) -> bool {
+            false
+        }
+    }
+    let store = MemoryStore::with_clock(Arc::new(FakeClock::default()), Arc::new(DenyConsume));
+    store.append("producer", new("a", "work")).unwrap();
+    assert_eq!(
+        store.claim_detailed(
+            &ConsumerId("probe".into()),
+            &Topic("work".into()),
+            Duration::from_secs(1)
+        ),
+        Err(Error::Unauthorized)
+    );
+}
