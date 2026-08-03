@@ -261,6 +261,30 @@ The format is based on [Keep a Changelog], and this project adheres to
   state, so the first successful `ack_work` or `nack_work` invalidates every
   outstanding copy.
 
+### Documentation
+
+- Added `docs/dev-dependency-licenses.md`, a receipt enumerating the 16
+  dev-only crates that arrived with `trybuild` and the licence each declares,
+  read from the packaged `Cargo.toml` under `$CARGO_HOME/registry/src` rather
+  than from index metadata. All are permissive and already permitted by
+  `deny.toml`; no code, manifest, or policy change follows.
+
+  The receipt exists because three claims are easy to run together and only one
+  of them was ever checked. `cargo deny check` passes — true, and it is the CI
+  gate. Its licence traversal evaluates 13 crates and reaches none of these 16 —
+  also true, and it is why the first claim implies nothing about the third. The
+  licences are acceptable — true, but established by looking, not by the gate.
+  `scripts/check-dev-dependency-licenses.py` re-derives the uncovered set from
+  `cargo deny list` itself and fails when the receipt drifts from the lockfile,
+  so it goes stale loudly. `deny.toml` and the README carry the coverage caveat
+  where someone reading either would otherwise assume the gate had looked.
+
+- Added `scripts/kani.sh`. A bare `cargo kani` at the workspace root fails —
+  Kani 0.67 pins rustc 1.93 and the crate's MSRV is 1.95 — and the working
+  invocation, `cargo kani -p interlockutor-kani`, previously lived only in a doc
+  comment. It is now a script, and the README says why the obvious command does
+  not work rather than only what to type instead.
+
 ### Fixed (recipient adapter)
 
 - The scavenger no longer deletes staging files whose age cannot be established.

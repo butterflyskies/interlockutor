@@ -10,6 +10,15 @@ all-features = true
 ignore = []
 
 # --- Licenses -------------------------------------------------------------
+#
+# Coverage note: this check does NOT evaluate the dev-only `trybuild` subtree.
+# `cargo deny list` enumerates 13 crates; the other 16 in Cargo.lock are never
+# examined, so a passing run is not evidence about their licences in either
+# direction. Those were verified by hand against their packaged metadata and
+# recorded in docs/dev-dependency-licenses.md, which
+# scripts/check-dev-dependency-licenses.py keeps honest. Widening the traversal
+# is a policy change and is tracked separately; do not cite this file's green
+# result as having cleared them.
 [licenses]
 allow = [
     "MIT",

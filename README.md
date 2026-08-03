@@ -12,8 +12,24 @@ The leased-work transition kernel is allocation-free and shared verbatim with
 an unpublished Kani proof crate. With Kani 0.67 installed, run all harnesses:
 
 ```console
-cargo kani --package=interlockutor-kani
+scripts/kani.sh
 ```
+
+**A bare `cargo kani` at the workspace root does not work**, and the script
+exists so that fact is enforced rather than described. Kani 0.67 pins rustc
+1.93 while the product crate's MSRV is 1.95, so building the whole workspace
+under Kani's toolchain fails on the version floor:
+
+```text
+error: rustc 1.93.0-nightly is not supported by the following package:
+  interlockutor@0.3.0 requires rustc 1.95
+```
+
+`crates/interlockutor-kani` exists to avoid exactly that. It declares
+`rust-version = "1.93"`, supplies the two primitive domain types the kernel
+imports, and then compiles `crates/interlockutor/src/kernel.rs` unchanged via
+`#[path]` — one transition implementation, not a model that can drift from it.
+The proofs are not run in CI; adding them is tracked separately.
 
 The proofs cover exclusive live leases, monotonic non-wrapping fences, stale
 owner and fence rejection, renewal identity, terminal acknowledgement, release
@@ -303,5 +319,17 @@ so on non-unix targets the call is a deliberate no-op.
 ## License
 
 Apache-2.0
+
+Dependency licences are gated by `cargo deny check` in CI. That gate's licence
+traversal covers 13 crates and **does not reach the dev-only `trybuild`
+subtree**, so a green run says nothing about those 16 crates in either
+direction. They were enumerated and verified by hand against their packaged
+metadata, and the result is recorded in
+[`docs/dev-dependency-licenses.md`](docs/dev-dependency-licenses.md). All are
+permissive and already permitted by `deny.toml`; no policy change follows.
+
+`scripts/check-dev-dependency-licenses.py` re-derives that set from the gate's
+own output and fails if the receipt has drifted from the lockfile, so a new or
+bumped dev dependency makes the record go stale loudly.
 
 [sealed-traits]: https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/
