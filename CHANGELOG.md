@@ -117,6 +117,15 @@ The format is based on [Keep a Changelog], and this project adheres to
 - `AcceptError::UnusableRecord` retains the underlying parse or I/O failure as
   an `Error::source` instead of flattening it into a message string.
 
+- Recipient acceptance no longer reads an unreadable record path as an absent
+  one. The redelivery fast path asked `Path::exists()`, which collapses every
+  metadata failure to `false` — no search permission on `effects/`, an I/O
+  error, or a dangling symlink standing where the record should be all read as
+  *nothing is here*, and that answer leads straight into the commit path. The
+  check is now `symlink_metadata`, so genuine absence, an occupied path, and a
+  failure to classify are three answers rather than two, and only the first
+  commits.
+
 - **Security (CI enforcement):** the three compile-fail guards protecting the
   lease-forgery fix are now enforced. They were `compile_fail` doctests, and
   were unenforced in two independent ways:

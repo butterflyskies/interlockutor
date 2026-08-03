@@ -754,11 +754,31 @@ impl EffectStore {
     /// link and exactly one wins. A hit on the fast path takes the identical
     /// durability repair and full-record validation as the `AlreadyExists` path,
     /// which remains in place for the racing case.
+    ///
+    /// # Absent, present, and unreadable are three answers, not two
+    ///
+    /// The check was `Path::exists()`, which collapses every metadata failure to
+    /// `false`. A record path that cannot be interrogated — no search permission
+    /// on `effects/`, an I/O error, a dangling symlink standing where the record
+    /// should be — read as *nothing is here*, which is the one reading the
+    /// recipient must never take on faith. It is also the reading that leads
+    /// straight into the commit path, so the adapter would go on to stage and
+    /// fsync a record on the strength of an answer it had not actually got.
+    ///
+    /// `symlink_metadata` splits the three cases apart. `NotFound` is genuine
+    /// absence and only that. Anything else present at the path — of any type,
+    /// symlinks not followed — goes to validation, which requires a full record
+    /// and reports [`AcceptError::UnusableRecord`] when it does not find one.
+    /// Any other error is propagated as itself: an unreadable path is a failure
+    /// to classify, and this store says so rather than guessing the safe-looking
+    /// answer.
     fn accept(&self, event: &Event) -> Result<AcceptanceOutcome, AcceptError> {
         let target = self.record_path(&event.id)?;
         let receipt = acceptance_receipt(event);
-        if target.exists() {
-            return self.validate_existing(&target, &receipt);
+        match fs::symlink_metadata(&target) {
+            Ok(_) => return self.validate_existing(&target, &receipt),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(AcceptError::Io(error)),
         }
         match self.commit(&target, &receipt)? {
             Commit::Linked => Ok(AcceptanceOutcome::Recorded(receipt)),
@@ -1625,6 +1645,72 @@ fn corrupt_existing_record_is_not_reported_as_prior_acceptance() -> Result<(), B
         );
         assert_eq!(recipient.staging_entries()?, 0, "{label} leaked staging");
     }
+    Ok(())
+}
+
+/// Something at the record path is never read as nothing being there.
+///
+/// The fast path asked `Path::exists()`, which collapses every metadata failure
+/// to `false`. A dangling symlink is the reachable, permission-independent half
+/// of that: `exists()` follows it, finds nothing, and answers absent — so the
+/// adapter concluded there was no record and ran the full commit against a path
+/// that was in fact occupied.
+///
+/// `symlink_metadata` does not follow, so the entry is seen for what it is and
+/// sent to validation, which cannot make a receipt out of it and reports
+/// `UnusableRecord`. The armed staging fault is what makes the two paths
+/// distinguishable rather than merely differently-routed: staging anything at
+/// all trips it, and the old route staged.
+#[cfg(unix)]
+#[test]
+fn an_unreadable_record_path_is_classified_rather_than_read_as_absent()
+-> Result<(), Box<dyn StdError>> {
+    let store = MemoryStore::with_clock(Arc::new(ManualClock::default()), Arc::new(AllowAll));
+    let appended = match store.append("dispatcher", urgent_message())? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let scratch = ScratchRoot::create()?;
+    let recipient = EffectStore::open(scratch.path())?;
+
+    let target = recipient.record_path(&appended.id)?;
+    std::os::unix::fs::symlink(scratch.path().join("no-such-record"), &target)?;
+    assert!(!target.exists(), "the fixture is a dangling symlink");
+    assert!(
+        fs::symlink_metadata(&target).is_ok(),
+        "the name is occupied"
+    );
+
+    recipient.fail_next_staging_removals(1);
+    let error = recipient
+        .accept(&appended)
+        .err()
+        .ok_or("an occupied but unreadable path is not an acceptance")?;
+    assert!(
+        matches!(error, AcceptError::UnusableRecord { .. }),
+        "an occupied path must be classified, not committed over: {error:?}"
+    );
+    assert!(
+        StdError::source(&error).is_some(),
+        "the underlying read failure must stay attached"
+    );
+    assert_eq!(
+        recipient.staging_entries()?,
+        0,
+        "nothing was staged against an occupied path"
+    );
+
+    // Genuine absence is still genuine absence: the same store accepts a fresh
+    // event normally, so the stricter check did not turn into refusing everything.
+    let other = match store.append("dispatcher", event_named("second-message"))? {
+        AppendOutcome::Appended(event) => event,
+        AppendOutcome::Existing(_) => return Err("append unexpectedly found an event".into()),
+    };
+    let fresh = EffectStore::open(scratch.path())?;
+    assert_eq!(
+        fresh.accept(&other)?,
+        AcceptanceOutcome::Recorded(acceptance_receipt(&other))
+    );
     Ok(())
 }
 
