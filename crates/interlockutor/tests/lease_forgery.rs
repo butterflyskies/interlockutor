@@ -14,10 +14,13 @@
 //! Compile-time absence cannot be asserted by a runtime `assert!`, so it is split
 //! in two:
 //!
-//! - The **non-construction** half lives in `compile_fail` doctests on `Lease`
-//!   and `ClaimOutcome` in `lib.rs`. Those are real tests, executed by
-//!   `cargo test --doc`. Note that `cargo nextest run` does not run doctests, so
-//!   that half needs its own command.
+//! - The **non-construction** half lives in the trybuild UI tests under
+//!   `tests/ui`, each with a committed `.stderr` pinning the exact diagnostic —
+//!   `E0451` for the lease itself, `E0026` for the fence disclosure. They are
+//!   ordinary `#[test]`s, so `cargo nextest run` executes them. They were
+//!   `compile_fail` doctests, which CI never ran and which cannot pin an error
+//!   code on stable; the snippets remaining in `lib.rs` are marked `ignore` and
+//!   are illustration, not enforcement. See `tests/compile_fail.rs`.
 //! - The **runtime** half is this file. It walks every route the public API
 //!   actually offers B for reaching a `Lease` over A's item, shows each one
 //!   yields no lease, and confirms the only mutation verbs B can call are the
@@ -138,7 +141,8 @@ fn losing_claimant_cannot_forge_the_winners_lease() -> Result<(), Box<dyn StdErr
     assert_eq!(canonical_event.id, event_id);
 
     // --- Route 1: build a Lease from those facts. Does not compile. ---
-    // See the `compile_fail` doctests on `Lease` and `ClaimOutcome` in lib.rs.
+    // See `tests/ui/lease_is_unconstructable.rs`, whose committed `.stderr`
+    // pins the `E0451` this depends on.
     // `Lease` has no public fields, no public constructor, no `Default`, and no
     // `From`/`Deserialize` impl, so there is no expression to write here.
 

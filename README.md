@@ -27,8 +27,9 @@ They also do not model **token provenance**. Each harness reasons about a
 supplied `(owner, fence)` pair; it proves a stale or wrong-owner token cannot
 mutate, not that only the rightful holder can produce a valid one. That premise
 is discharged by the type system instead — `Lease` is unconstructable outside
-the crate — and is checked by `compile_fail` doctests, not by a harness. Read
-"the kernel is proven" as exactly that, and not as "token provenance is proven".
+the crate — and is checked by the trybuild UI tests in
+`crates/interlockutor/tests/ui`, not by a harness. Read "the kernel is proven"
+as exactly that, and not as "token provenance is proven".
 
 ## Claiming and contention
 
@@ -43,12 +44,34 @@ projection of the same single computation, collapsing `Contended` and `Empty`
 into `None`. It is not the protocol contract, and new consumers should not use
 it.
 
-`EventStoreExt` is a sealed blanket impl over every `EventStore`, not a provided
-trait method. A backend cannot supply a second `claim` body, so the equivalence
+`EventStoreExt` is a blanket impl over every `EventStore`, not a provided trait
+method. A backend cannot supply a second `claim` body, so the equivalence
 `claim(..) == claim_detailed(..)?.granted()` holds because there is only one
 implementation of it — previously that was a doc claim over an overridable
 method. Callers need `EventStoreExt` in scope; backends implement `EventStore`
 and get the projection for free.
+
+**What excludes a second body is coherence, not sealing.** `EventStoreExt` does
+carry a private `sealed::Sealed` supertrait, and that supertrait excludes
+nothing: it is blanket-implemented over the same bound `EventStoreExt` already
+requires, so it is satisfied exactly when `EventStore` is. The blanket impl is
+the mechanism — it already covers every `T: EventStore`, so a second impl
+overlaps it and the compiler rejects the overlap with `E0119`. Measured both
+ways: removing the seal leaves all three compile-fail guards passing with
+byte-identical output, and removing the blanket impl instead makes the
+substitution guard compile.
+
+This is worth keeping straight because the exclusions in this crate are
+independent and easy to conflate. Lease forgery is held by `E0451` — `Lease` has
+private fields and no constructor — which is a property of `Lease` alone and
+holds with both the seal and the blanket impl removed. Sealing in general is a
+real technique and is [unrelated to coherence][sealed-traits]; it is simply not
+what is operating here.
+
+The trybuild case pinning `E0119` is what *enforces* this; the citation only
+explains it. A cited claim is verifiable but never automatically verified, and
+nothing turns red when a link rots — so the committed `.stderr` is the guard,
+and the footnote does not stand in for it.
 
 Available work always wins — the scan looks for a grant across the whole topic
 before reporting contention. Because `claim_detailed` takes no `EventId`, a
@@ -112,17 +135,23 @@ implement the trait and pass the same conformance suite.
 It is recorded rather than resolved, because every quick resolution is weaker
 than it looks: a public constructor restores the forgery path; a cargo feature
 is build-time role separation rather than a boundary, since features unify
-across a dependency graph; a sealed minting trait excludes exactly the party
-that needs it. The shape that works is a store-bound lease, valid only against
+across a dependency graph; a *properly* sealed minting trait — one whose private
+supertrait is implemented only for named in-crate types, unlike the crate's
+existing `sealed::Sealed`, which is blanket-implemented and excludes nothing —
+works as a boundary and for exactly that reason excludes the party that needs
+it. The shape that works is a store-bound lease, valid only against
 the store that issued it, which needs a store-identity concept the crate does
 not have. The seam needs a design decision, and reopening construction to
 unblock an implementor before that decision would reintroduce the vulnerability.
 
-The forgery is now unexpressible rather than merely rejected. `compile_fail`
-doctests on `Lease`, `ClaimOutcome`, and `EventStoreExt` record that, and the
-`lease_forgery` integration trace walks every runtime route a losing claimant
-has. Note that `cargo nextest run` does not execute doctests, so the
-compile-time half needs `cargo test --doc`.
+The forgery is now unexpressible rather than merely rejected. Three trybuild UI
+tests under `crates/interlockutor/tests/ui` record that, each with a committed
+`.stderr` pinning the exact diagnostic, and the `lease_forgery` integration
+trace walks every runtime route a losing claimant has. These were `compile_fail`
+doctests, which CI never ran and which cannot pin an error code on stable; they
+are ordinary `#[test]`s now, so `cargo nextest run` executes them with no extra
+step. The illustrative snippets left in the docs are marked `ignore` and prove
+nothing on their own — the UI tests are the guard.
 
 ## Courier dogfood contract
 
@@ -274,3 +303,5 @@ so on non-unix targets the call is a deliberate no-op.
 ## License
 
 Apache-2.0
+
+[sealed-traits]: https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/

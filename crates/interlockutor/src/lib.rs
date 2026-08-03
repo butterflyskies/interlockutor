@@ -537,8 +537,12 @@ impl Authorizer for AllowAll {
 /// - **A cargo feature gating minting** is build-time role separation, not a
 ///   security boundary: features unify across a dependency graph, so any crate
 ///   in the binary enabling it re-opens forgery for every other crate.
-/// - **A sealed minting trait** cannot be implemented by the third party that
-///   needs it — sealing is what excludes them in the first place.
+/// - **A sealed minting trait** would work as a boundary, and for exactly that
+///   reason cannot be implemented by the third party that needs it: a seal whose
+///   private supertrait is implemented only for named in-crate types excludes
+///   everyone else by construction. Note that this is *not* the shape of
+///   [`sealed::Sealed`] in this crate, which is blanket-implemented and excludes
+///   nothing. Sealing done properly is the problem here, not the solution.
 /// - **A store-bound lease**, where a minted token is only valid against the
 ///   store that issued it, is the shape that actually works. It needs a store
 ///   identity concept the crate does not have yet.
@@ -616,8 +620,28 @@ pub trait EventStore: Send + Sync {
 }
 
 mod sealed {
-    /// Blanket-implemented for every backend and implementable by nobody else,
-    /// so [`super::EventStoreExt`] cannot be given a second body downstream.
+    /// Marker supertrait on [`super::EventStoreExt`].
+    ///
+    /// # This excludes nothing, and is not what protects the projection
+    ///
+    /// Said plainly, because the name invites the opposite reading. `Sealed` is
+    /// blanket-implemented for `T: EventStore + ?Sized` — the *same* bound
+    /// [`super::EventStoreExt`] already carries as a supertrait. It is therefore
+    /// satisfied exactly when `EventStore` is, and it turns away no type that
+    /// `EventStore` has not turned away first.
+    ///
+    /// Measured, not argued. Removing this bound from `EventStoreExt` leaves all
+    /// three trybuild guards passing with byte-identical `.stderr`, the
+    /// substitution case included. Removing the *blanket impl* instead makes
+    /// that same case compile. The exclusion lives in the blanket impl.
+    ///
+    /// It is kept as a statement of intent and as a seal that would begin to do
+    /// work under a future narrowing: were the blanket `EventStoreExt` impl ever
+    /// restricted to named in-crate types, this bound would have to be
+    /// restricted with it, and only then would it exclude anything. Sealing is a
+    /// real technique and it is unrelated to coherence; it is simply not the
+    /// mechanism operating here. See
+    /// <https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/>.
     pub trait Sealed {}
     impl<T: super::EventStore + ?Sized> Sealed for T {}
 }
@@ -631,23 +655,45 @@ mod sealed {
 /// chances to observe different state. The doc said "by construction" over
 /// something a downstream impl could replace.
 ///
-/// It is now a blanket impl over every `T: EventStore`, sealed by a private
-/// supertrait. There is exactly one body, no backend can substitute another, and
-/// the equivalence really does hold by construction.
+/// It is now a blanket impl over every `T: EventStore`. There is exactly one
+/// body, no backend can substitute another, and the equivalence really does hold
+/// by construction.
 ///
 /// Backends implement [`EventStore`] and get this for free. Callers need
 /// `EventStoreExt` in scope to call [`EventStoreExt::claim`].
 ///
-/// # What enforces this is coherence; the seal is belt-and-braces
+/// # What excludes a second body is coherence. The seal excludes nothing.
 ///
-/// Stated precisely, because "sealed by a private supertrait" over-credits the
-/// seal. [`sealed::Sealed`] is blanket-implemented for `T: EventStore + ?Sized`
-/// — the same bound as the blanket `EventStoreExt` impl — so it is satisfied
-/// exactly when `EventStore` is and excludes no type on its own. A backend that
-/// implements `EventStore` is already covered by the blanket impl, so a second
-/// body is a coherence error (`E0119`) before sealing is consulted; a type that
-/// does not implement `EventStore` is rejected by the supertrait bound. Either
-/// way the substitution is impossible, which is what the doc promises.
+/// "Sealed by a private supertrait" credited the wrong mechanism, and the
+/// crate's own thesis is that mechanisms should be credited accurately. Three
+/// exclusions are at work here and they are independent; none of them may
+/// borrow another's credit:
+///
+/// - **Lease forgery** is held by `E0451`. [`Lease`]'s fields are private and
+///   there is no constructor, so the type is unbuildable outside the crate.
+///   That is a property of `Lease` alone. It has nothing to do with this trait,
+///   with the blanket impl, or with sealing, and it holds identically with both
+///   of those removed. Guard: `tests/ui/lease_is_unconstructable.rs`.
+/// - **Substitution of this projection** is held by coherence, `E0119`. The
+///   blanket impl below already covers every `T: EventStore`, so a second impl
+///   for any backend overlaps it and the compiler rejects the overlap. Guard:
+///   `tests/ui/event_store_ext_cannot_be_substituted.rs`.
+/// - **[`sealed::Sealed`] holds nothing at all.** It is blanket-implemented over
+///   the same bound this trait already requires, so it is satisfied exactly when
+///   `EventStore` is. Removing it from the supertrait list leaves all three
+///   guards passing with byte-identical `.stderr`; removing the blanket impl
+///   instead makes the substitution case compile.
+///
+/// Sealing in general is a genuine technique and it is *unrelated to coherence*:
+/// see <https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/>, which
+/// says so outright. Read that as background for why the two were conflated
+/// here, not as the thing keeping the guarantee true.
+///
+/// **The trybuild case is the enforcement; the citation is only the
+/// explanation.** A cited claim is verifiable but never automatically verified —
+/// links rot, articles are revised, and nothing turns red when they do. The
+/// committed `.stderr` pinning `E0119` is what fails the build if this stops
+/// being true, and no footnote may be read as standing in for it.
 ///
 /// # Substituting the projection does not compile
 ///

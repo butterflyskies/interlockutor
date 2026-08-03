@@ -57,9 +57,12 @@ The format is based on [Keep a Changelog], and this project adheres to
   As a provided trait method, `claim` was overridable, so the documented
   single-authority equivalence held only by an implementor's goodwill — two
   computations, two lock acquisitions, two chances to observe different state.
-  A blanket impl behind a private sealed supertrait means there is exactly one
-  body and no backend can substitute another, so the equivalence now holds by
-  construction rather than by documentation.
+  A blanket impl means there is exactly one body and no backend can substitute
+  another, so the equivalence now holds by construction rather than by
+  documentation. What excludes a second body is **coherence** against that
+  blanket impl (`E0119`); the private `sealed::Sealed` supertrait excludes
+  nothing, being blanket-implemented over the same bound. See the enforcement
+  entry below.
 
 - Replaced the leased-work transition internals with a small semantic kernel
   shared verbatim with an unpublished Kani proof crate. Fence exhaustion now
@@ -168,6 +171,23 @@ The format is based on [Keep a Changelog], and this project adheres to
   `T: EventStore + ?Sized`, the same bound as `EventStoreExt`'s blanket impl, so
   it is satisfied exactly when `EventStore` is and excludes no type on its own.
   The guarantee is unchanged and real; the attribution was wrong.
+
+  The correction is now carried through every place the crate described the
+  mechanism — `sealed::Sealed`, `EventStoreExt`, the backend-seam note on
+  `EventStore`, the UI test, and the README — because the commit that made it
+  still said elsewhere that the seal did the excluding. Both directions were
+  measured rather than reasoned about: dropping `sealed::Sealed` from the
+  supertrait list leaves all three guards failing with byte-identical `.stderr`,
+  and dropping the blanket impl instead makes the substitution case compile
+  while `lease_is_unconstructable` keeps failing with its unchanged `E0451`.
+
+  The three exclusions are independent and are now documented as such. Lease
+  forgery is held by `E0451`, private fields on `Lease`, and holds with both the
+  seal and the blanket impl removed. Substitution is held by coherence. Sealing
+  holds nothing here, though it is a real technique and is
+  [unrelated to coherence](https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/).
+  The trybuild case is what enforces the claim; the citation only explains it,
+  and a link that rots turns nothing red.
 
 - A lease that spent the last fencing token no longer pins the claim scan floor
   forever. A real lease can be granted at `Fence(u64::MAX)`; when it lapses

@@ -14,11 +14,10 @@
 //! the only way an out-of-crate type can satisfy this trait at all. That is the
 //! documented backend-seam break, and it is not what this test is about.
 //!
-//! # What actually rejects this is coherence, not the seal
+//! # What rejects this is coherence. The seal rejects nothing.
 //!
 //! The committed expectation is **E0119, conflicting implementations** — not the
-//! E0277 an unsatisfied `sealed::Sealed` bound would produce. That is worth
-//! stating plainly, because the crate docs attribute the guarantee to sealing:
+//! E0277 an unsatisfied `sealed::Sealed` bound would produce:
 //!
 //! - `sealed::Sealed` is blanket-implemented for `T: EventStore + ?Sized`, which
 //!   is the *same* bound as the blanket `EventStoreExt` impl. So `Sealed` is
@@ -29,8 +28,17 @@
 //! - For a type that does not, the `EventStore` supertrait bound rejects it, and
 //!   `Sealed` again adds nothing. That is the vacuous case this file replaced.
 //!
-//! The guarantee is real and this test enforces it. The mechanism is the blanket
-//! impl, with the seal as belt-and-braces.
+//! Both directions were measured rather than reasoned about. Dropping
+//! `sealed::Sealed` from the `EventStoreExt` supertrait list leaves this case,
+//! and the other two, failing with byte-identical `.stderr`. Dropping the
+//! blanket impl instead makes this case **compile** — trybuild reports
+//! "expected test case to fail to compile, but it succeeded" — while
+//! `lease_is_unconstructable.rs` keeps failing with its unchanged `E0451`, which
+//! is what shows the forgery guard does not depend on any of this either.
+//!
+//! Sealing is a real technique and is unrelated to coherence
+//! (<https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/>). This
+//! file, not that link, is what fails the build if the guarantee goes away.
 
 use interlockutor::{
     AppendOutcome, BroadcastAck, ClaimOutcome, ConsumerId, Error, Event, EventStore, EventStoreExt,
