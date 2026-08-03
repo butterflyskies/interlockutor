@@ -177,9 +177,10 @@ The format is based on [Keep a Changelog], and this project adheres to
   `EventStore`, the UI test, and the README — because the commit that made it
   still said elsewhere that the seal did the excluding. Both directions were
   measured rather than reasoned about: dropping `sealed::Sealed` from the
-  supertrait list leaves all three guards failing with byte-identical `.stderr`,
-  and dropping the blanket impl instead makes the substitution case compile
-  while `lease_is_unconstructable` keeps failing with its unchanged `E0451`.
+  supertrait list leaves all three cases still failing to compile with
+  byte-identical `.stderr`, and dropping the blanket impl instead makes the
+  substitution case compile while `lease_is_unconstructable` keeps failing with
+  its unchanged `E0451`.
 
   The three exclusions are independent and are now documented as such. Lease
   forgery is held by `E0451`, private fields on `Lease`, and holds with both the
