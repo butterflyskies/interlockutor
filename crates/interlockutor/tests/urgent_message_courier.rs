@@ -126,6 +126,14 @@ const MIN_CONCURRENT_STALE_AFTER: Duration = Duration::from_secs(60);
 /// Filenames must fit the common single-component limit of 255 bytes.
 const MAX_NAME_BYTES: usize = 255;
 
+/// The longest raw [`EventId`] that can fit, derived from the encoding.
+///
+/// [`encode_event_id`] emits exactly `1 + 2n` bytes for an `n`-byte id, so the
+/// name limit is equivalent to this bound on the *input*. Deriving it rather
+/// than writing `127` keeps the two from drifting if the prefix or the radix
+/// ever changes.
+const MAX_EVENT_ID_BYTES: usize = (MAX_NAME_BYTES - 1) / 2;
+
 /// How many colliding quarantine names to try before giving up and reporting.
 ///
 /// Bounded rather than unbounded so a pathological directory cannot make a
@@ -165,9 +173,13 @@ enum AcceptanceOutcome {
 /// Failures the recipient can report, separately from a successful acceptance.
 #[derive(Debug)]
 enum AcceptError {
-    /// The encoded [`EventId`] does not fit in one path component.
+    /// The [`EventId`] is too long to encode into one path component.
+    ///
+    /// Decided from the raw byte length, before anything is allocated for it:
+    /// see [`encode_event_id`].
     EventIdTooLong {
-        encoded: usize,
+        id_bytes: usize,
+        max_id_bytes: usize,
     },
     /// A record exists at the target path but is unreadable, truncated, empty,
     /// or is not the receipt this event should have produced.
@@ -212,9 +224,13 @@ impl AcceptError {
 impl fmt::Display for AcceptError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::EventIdTooLong { encoded } => write!(
+            Self::EventIdTooLong {
+                id_bytes,
+                max_id_bytes,
+            } => write!(
                 f,
-                "encoded event ID is {encoded} bytes, over the {MAX_NAME_BYTES}-byte name limit"
+                "event ID is {id_bytes} bytes; over {max_id_bytes} it cannot hex-encode \
+                 within the {MAX_NAME_BYTES}-byte name limit"
             ),
             Self::UnusableRecord { path, reason, .. } => {
                 write!(
@@ -264,18 +280,30 @@ impl From<io::Error> for AcceptError {
 /// stored in the record body, and the whole record is re-verified on every
 /// `Existing` path, so an encoding accident could not silently read as
 /// acceptance of a different event.
+/// The bound is decided from the *input*, before the expansion. The encoding is
+/// exactly `1 + 2n` bytes for an `n`-byte id, so nothing about the output has to
+/// be built to know whether it fits. Expanding first meant a caller-supplied id
+/// was allocated at twice its own length purely in order to be refused — the
+/// length is the hostile input, so the refusal belongs in front of the
+/// allocation rather than behind it.
 fn encode_event_id(id: &EventId) -> Result<String, AcceptError> {
-    let mut encoded = String::with_capacity(id.0.len() * 2 + 1);
+    let raw = id.0.as_bytes();
+    if raw.len() > MAX_EVENT_ID_BYTES {
+        return Err(AcceptError::EventIdTooLong {
+            id_bytes: raw.len(),
+            max_id_bytes: MAX_EVENT_ID_BYTES,
+        });
+    }
+    let mut encoded = String::with_capacity(raw.len() * 2 + 1);
     encoded.push('e');
-    for byte in id.0.as_bytes() {
+    for byte in raw {
         encoded.push(char::from_digit(u32::from(byte >> 4), 16).expect("nibble is a hex digit"));
         encoded.push(char::from_digit(u32::from(byte & 0x0f), 16).expect("nibble is a hex digit"));
     }
-    if encoded.len() > MAX_NAME_BYTES {
-        return Err(AcceptError::EventIdTooLong {
-            encoded: encoded.len(),
-        });
-    }
+    debug_assert!(
+        encoded.len() <= MAX_NAME_BYTES,
+        "the input bound must imply the name bound"
+    );
     Ok(encoded)
 }
 
@@ -1580,14 +1608,46 @@ fn hostile_event_ids_are_confined_and_never_collide() -> Result<(), Box<dyn StdE
     Ok(())
 }
 
-/// An id too long to encode is refused up front, not silently truncated.
+/// An oversized id is refused from its own length, before it is expanded.
+///
+/// Two things are asserted, and the boundary is what makes them mean anything.
+/// The longest accepted id encodes to exactly the name limit, so the derived
+/// input bound is neither loose nor conservative; one byte more is refused, and
+/// the error carries the raw length rather than a length that only exists after
+/// the allocation the check exists to avoid.
 #[test]
-fn oversized_event_id_is_refused_rather_than_truncated() -> Result<(), Box<dyn StdError>> {
+fn oversized_event_id_is_refused_from_its_raw_length() -> Result<(), Box<dyn StdError>> {
     let scratch = ScratchRoot::create()?;
     let recipient = EffectStore::open(scratch.path())?;
-    let long = EventId("x".repeat(MAX_NAME_BYTES));
+
+    let longest = EventId("x".repeat(MAX_EVENT_ID_BYTES));
+    let path = recipient.record_path(&longest)?;
+    assert_eq!(
+        path.file_name().expect("a record path has a name").len(),
+        MAX_NAME_BYTES,
+        "the largest accepted id must encode to exactly the name limit"
+    );
+
+    let over = EventId("x".repeat(MAX_EVENT_ID_BYTES + 1));
+    let error = recipient
+        .record_path(&over)
+        .err()
+        .ok_or("one byte over the bound must be refused")?;
+    assert!(
+        matches!(
+            error,
+            AcceptError::EventIdTooLong {
+                id_bytes,
+                max_id_bytes,
+            } if id_bytes == MAX_EVENT_ID_BYTES + 1 && max_id_bytes == MAX_EVENT_ID_BYTES
+        ),
+        "unexpected {error:?}"
+    );
+
+    // A wildly oversized id is refused the same way, without being expanded to
+    // two megabytes first.
     assert!(matches!(
-        recipient.record_path(&long),
+        recipient.record_path(&EventId("x".repeat(1_000_000))),
         Err(AcceptError::EventIdTooLong { .. })
     ));
     Ok(())

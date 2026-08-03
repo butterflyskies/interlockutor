@@ -117,6 +117,14 @@ The format is based on [Keep a Changelog], and this project adheres to
 - `AcceptError::UnusableRecord` retains the underlying parse or I/O failure as
   an `Error::source` instead of flattening it into a message string.
 
+- An oversized `EventId` is refused from its raw byte length, before it is
+  hex-expanded. The encoding is exactly `1 + 2n` bytes for an `n`-byte id, so
+  the name limit is equivalent to a bound on the input — and the old order built
+  the whole expansion, at twice a caller-supplied length, purely in order to
+  throw it away. The accepted set is unchanged; the boundary is now asserted
+  from both sides, and the error reports the raw length rather than one that
+  only exists after the allocation the check exists to avoid.
+
 - Recipient acceptance no longer reads an unreadable record path as an absent
   one. The redelivery fast path asked `Path::exists()`, which collapses every
   metadata failure to `false` — no search permission on `effects/`, an I/O
