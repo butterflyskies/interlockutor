@@ -5,9 +5,9 @@
 //! are coupled, so this guard stands alongside `lease_is_unconstructable.rs`
 //! rather than being covered by it.
 
-use interlockutor::{ClaimOutcome, Fence};
+use interlockutor::{ClaimOutcome, Fence, Lease};
 
-fn holders_fence(outcome: &ClaimOutcome) -> Option<Fence> {
+fn holders_fence(outcome: &ClaimOutcome<Lease>) -> Option<Fence> {
     match outcome {
         ClaimOutcome::Contended { fence, .. } => Some(*fence),
         _ => None,

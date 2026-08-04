@@ -49,6 +49,8 @@ use std::time::Duration;
 struct Backend;
 
 impl EventStore for Backend {
+    type Lease = Lease;
+
     fn append(&self, _: &str, _: NewEvent) -> Result<AppendOutcome, Error> {
         todo!()
     }
@@ -66,7 +68,7 @@ impl EventStore for Backend {
         _: &ConsumerId,
         _: &Topic,
         _: Duration,
-    ) -> Result<ClaimOutcome, Error> {
+    ) -> Result<ClaimOutcome<Lease>, Error> {
         todo!()
     }
 

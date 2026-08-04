@@ -342,9 +342,9 @@ impl Lease {
 /// `.stderr` pins the exact `E0026`. See `tests/compile_fail.rs` for why these
 /// guards are UI tests rather than `compile_fail` doctests.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum ClaimOutcome {
+pub enum ClaimOutcome<L> {
     /// The caller now holds the lease described here.
-    Granted(Lease),
+    Granted(L),
     /// Nothing was claimable, and live work is held by another consumer.
     ///
     /// Reported only for work that is *currently leased and unexpired*.
@@ -380,14 +380,14 @@ pub enum ClaimOutcome {
     Empty,
 }
 
-impl ClaimOutcome {
+impl<L> ClaimOutcome<L> {
     /// Projects onto the lossy [`EventStoreExt::claim`] shape.
     ///
     /// `Granted` becomes `Some`; `Contended` and `Empty` both collapse to
     /// `None`. This is the single definition of that projection, so
     /// `store.claim(..) == store.claim_detailed(..).granted()` holds by
     /// construction rather than by two implementations agreeing.
-    pub fn granted(self) -> Option<Lease> {
+    pub fn granted(self) -> Option<L> {
         match self {
             Self::Granted(lease) => Some(lease),
             Self::Contended { .. } | Self::Empty => None,
@@ -526,36 +526,25 @@ impl Authorizer for AllowAll {
 /// Delivery is at-least-once. Effects performed by consumers must therefore be
 /// idempotent. Ordering is guaranteed per topic, never globally.
 ///
-/// # Known break: out-of-crate backends cannot currently implement this
+/// # Each store defines its own lease type
 ///
-/// [`EventStore::claim_detailed`] and [`EventStore::renew`] return [`Lease`]
-/// values, and `Lease` is deliberately unconstructable outside this crate. A
-/// third-party backend therefore has no way to produce one, so as of this commit
-/// **only in-crate backends can implement `EventStore`**.
+/// [`EventStore::Lease`] is an associated type. The reference [`MemoryStore`]
+/// uses [`Lease`], whose fields are private to prevent consumer forgery — see
+/// the design note on that type. External backends define their own lease type
+/// with whatever opacity their threat model requires, and construct it freely
+/// within their `claim_detailed` and `renew` implementations. A lease minted
+/// by one store cannot be presented to another: the type system enforces this
+/// at compile time.
 ///
-/// That is a real regression against the stated goal that persistent and
-/// distributed backends implement this trait and pass the same conformance
-/// suite. It is recorded here rather than quietly resolved, because the obvious
-/// resolutions are all weaker than they look:
-///
-/// - **A public minting constructor** returns the crate to the state that made
-///   forgery possible. Not an option.
-/// - **A cargo feature gating minting** is build-time role separation, not a
-///   security boundary: features unify across a dependency graph, so any crate
-///   in the binary enabling it re-opens forgery for every other crate.
-/// - **A sealed minting trait** would work as a boundary, and for exactly that
-///   reason cannot be implemented by the third party that needs it: a seal whose
-///   private supertrait is implemented only for named in-crate types excludes
-///   everyone else by construction. Note that this is *not* the shape of
-///   [`sealed::Sealed`] in this crate, which is blanket-implemented and excludes
-///   nothing. Sealing done properly is the problem here, not the solution.
-/// - **A store-bound lease**, where a minted token is only valid against the
-///   store that issued it, is the shape that actually works. It needs a store
-///   identity concept the crate does not have yet.
-///
-/// The seam is unresolved and needs a design decision. Reopening construction to
-/// unblock an implementor without solving it would reintroduce the vulnerability
-/// this commit closes.
+/// This is the store-bound minting design. Forgery resistance for the reference
+/// store rests on [`Lease`]'s private fields and on
+/// [`ClaimOutcome::Contended`] not disclosing the active fence; those two
+/// properties are coupled and neither may be relaxed on the grounds that the
+/// other covers it. External backends decide their own opacity: the trait
+/// requires only `Clone + Debug + Send + Sync`. A backend whose lease type is
+/// publicly constructable must ensure that the data disclosed in `Contended` is
+/// insufficient to forge a valid lease — that is the obligation the associated
+/// type delegates.
 ///
 /// This synchronous trait is the local/reference contract. Network adapters
 /// should expose their own asynchronous API rather than blocking an async
@@ -564,6 +553,10 @@ impl Authorizer for AllowAll {
 /// and compaction are intentionally not part of the MVP contract; the reference
 /// store is unbounded.
 pub trait EventStore: Send + Sync {
+    /// The lease token this store issues. Each backend defines its own opaque
+    /// type; the reference [`MemoryStore`] uses [`Lease`].
+    type Lease: Clone + fmt::Debug + Send + Sync;
+
     fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error>;
 
     fn read_broadcast(
@@ -603,12 +596,12 @@ pub trait EventStore: Send + Sync {
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<ClaimOutcome, Error>;
+    ) -> Result<ClaimOutcome<Self::Lease>, Error>;
 
     /// Renews a current lease without changing its owner or fence.
     ///
     /// Duration validation is identical to [`EventStore::claim_detailed`].
-    fn renew(&self, lease: &Lease, lease_for: Duration) -> Result<Lease, Error>;
+    fn renew(&self, lease: &Self::Lease, lease_for: Duration) -> Result<Self::Lease, Error>;
 
     /// Makes work terminal in this store; it does not transact external effects.
     ///
@@ -618,11 +611,11 @@ pub trait EventStore: Send + Sync {
     /// record, not an authenticated or durable receipt. Callers that need
     /// replay-stable acceptance must provide that guarantee at the recipient
     /// boundary before acknowledging the queue item.
-    fn ack_work(&self, lease: &Lease) -> Result<WorkAck, Error>;
+    fn ack_work(&self, lease: &Self::Lease) -> Result<WorkAck, Error>;
 
     /// Releases work immediately. The next claim receives a higher fence
     /// unless this lease consumed the last fencing token.
-    fn nack_work(&self, lease: &Lease) -> Result<(), Error>;
+    fn nack_work(&self, lease: &Self::Lease) -> Result<(), Error>;
 }
 
 mod sealed {
@@ -727,7 +720,7 @@ pub trait EventStoreExt: EventStore + sealed::Sealed {
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<Option<Lease>, Error>;
+    ) -> Result<Option<Self::Lease>, Error>;
 }
 
 impl<T: EventStore + ?Sized> EventStoreExt for T {
@@ -736,7 +729,7 @@ impl<T: EventStore + ?Sized> EventStoreExt for T {
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<Option<Lease>, Error> {
+    ) -> Result<Option<Self::Lease>, Error> {
         Ok(self.claim_detailed(consumer, topic, lease_for)?.granted())
     }
 }
@@ -853,6 +846,8 @@ impl MemoryStore {
 }
 
 impl EventStore for MemoryStore {
+    type Lease = Lease;
+
     fn append(&self, producer: &str, event: NewEvent) -> Result<AppendOutcome, Error> {
         if !self.authorizer.can_publish(producer, &event.topic) {
             return Err(Error::Unauthorized);
@@ -971,7 +966,7 @@ impl EventStore for MemoryStore {
         consumer: &ConsumerId,
         topic: &Topic,
         lease_for: Duration,
-    ) -> Result<ClaimOutcome, Error> {
+    ) -> Result<ClaimOutcome<Lease>, Error> {
         if !self.authorizer.can_consume(consumer, topic) {
             return Err(Error::Unauthorized);
         }

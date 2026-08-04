@@ -678,7 +678,7 @@ fn contention_fixture(scenario: &str) -> MemoryStore {
     store
 }
 
-fn probe(store: &MemoryStore) -> ClaimOutcome {
+fn probe(store: &MemoryStore) -> ClaimOutcome<Lease> {
     store
         .claim_detailed(
             &ConsumerId("probe".into()),
