@@ -208,8 +208,10 @@ impl<Owner: Clone + Eq> LeaseKernel<Owner> {
     /// - `Acknowledged` and `Exhausted` are terminal by construction.
     /// - `Available` with the last fence issued can never be leased again, since
     ///   the next fence would have to wrap. [`LeaseKernel::claim`] normalizes
-    ///   that state to `Exhausted` the first time it is asked, so this arm
-    ///   covers a kernel built directly at the ceiling rather than driven there.
+    ///   that state to `Exhausted` the first time it is asked, but this arm is
+    ///   reached before that normalization — both by direct construction (tests)
+    ///   and by [`LeaseKernel::release`] on a lease issued at the last fence,
+    ///   which sets the phase to `Available` without checking `last_issued`.
     /// - `Leased` is excluded. A live lease is a holder that must still be
     ///   reported as contention, and an expired one only becomes terminal as
     ///   time passes. Being conservative here costs at most a re-examined item

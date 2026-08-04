@@ -214,6 +214,33 @@ fn broadcast_consumers_have_independent_contiguous_cursors() {
 }
 
 #[test]
+fn ack_broadcast_rejects_sequence_zero() {
+    let (store, _) = fixture();
+    let topic = Topic("news".into());
+    let a = ConsumerId("a".into());
+    append(&store, "1", "news");
+    assert_eq!(store.ack_broadcast(&a, &topic, 0), Err(Error::UnknownEvent));
+}
+
+#[test]
+fn ack_broadcast_rejects_sequence_beyond_topic_length() {
+    let (store, _) = fixture();
+    let topic = Topic("news".into());
+    let a = ConsumerId("a".into());
+    append(&store, "1", "news");
+    // Topic has 1 event; sequence 2 is past the end.
+    assert_eq!(store.ack_broadcast(&a, &topic, 2), Err(Error::UnknownEvent));
+}
+
+#[test]
+fn ack_broadcast_on_empty_topic_rejects_any_sequence() {
+    let (store, _) = fixture();
+    let topic = Topic("empty".into());
+    let a = ConsumerId("a".into());
+    assert_eq!(store.ack_broadcast(&a, &topic, 1), Err(Error::UnknownEvent));
+}
+
+#[test]
 fn claim_is_exclusive_until_expiry_then_fence_increases() {
     let (store, clock) = fixture();
     append(&store, "job", "work");
@@ -735,6 +762,32 @@ fn contention_names_the_lowest_sequence_holder() {
             event_id: EventId("a".into()),
             holder: ConsumerId("holder-a".into()),
             expires_at: 1000,
+        }
+    );
+}
+
+#[test]
+fn self_holding_consumer_sees_itself_as_the_contended_holder() {
+    let (store, _clock) = fixture();
+    let topic = Topic("work".into());
+    let consumer = ConsumerId("courier".into());
+    append(&store, "a", "work");
+    let lease = store
+        .claim_detailed(&consumer, &topic, Duration::from_secs(1))
+        .unwrap();
+    let ClaimOutcome::Granted(held) = lease else {
+        panic!("first claim must grant");
+    };
+    // A consumer that already holds the only live item, and claims again, is
+    // told that it is the holder — not an error and not a special case.
+    assert_eq!(
+        store
+            .claim_detailed(&consumer, &topic, Duration::from_secs(1))
+            .unwrap(),
+        ClaimOutcome::Contended {
+            event_id: EventId("a".into()),
+            holder: consumer.clone(),
+            expires_at: held.expires_at(),
         }
     );
 }

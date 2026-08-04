@@ -1055,8 +1055,6 @@ impl EventStore for MemoryStore {
             .renew(&lease.owner, lease.fence, now, expires_at)
             .map_err(map_lease_error)?;
         Ok(Lease {
-            owner: renewed.owner,
-            fence: renewed.fence,
             expires_at: renewed.expires_at,
             ..lease.clone()
         })
@@ -1077,7 +1075,7 @@ impl EventStore for MemoryStore {
             .get_mut(&lease.event.id)
             .expect("validated lease state exists")
             .acknowledge(&lease.owner, lease.fence, now)
-            .expect("validated lease remains valid");
+            .map_err(map_lease_error)?;
         Ok(WorkAck {
             event_id: lease.event.id.clone(),
             owner: lease.owner.clone(),

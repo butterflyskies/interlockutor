@@ -31,6 +31,17 @@
 
 #[test]
 fn security_boundary_guards_do_not_compile() {
+    // Assert the expected guard count so a deleted `.rs` or `.stderr` file
+    // fails the build rather than silently running fewer cases.
+    let guard_count = std::fs::read_dir("tests/ui")
+        .expect("tests/ui/ must exist")
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "rs"))
+        .count();
+    assert_eq!(
+        guard_count, 3,
+        "expected 3 compile-fail guards in tests/ui/; found {guard_count}"
+    );
     let cases = trybuild::TestCases::new();
     cases.compile_fail("tests/ui/*.rs");
 }

@@ -200,10 +200,13 @@ impl EventStore for ExternalStore {
             }
             // Grant: this is the key line the associated type enables.
             // An external backend can construct its own lease type.
-            let next = work
-                .fence_counter
-                .checked_add(1)
-                .ok_or(Error::InvalidLeaseDuration)?;
+            let Some(next) = work.fence_counter.checked_add(1) else {
+                // Fence space exhausted for this item. Mark it terminal and
+                // continue the scan, matching MemoryStore's behaviour: exhausted
+                // items are permanently unavailable and the search moves on.
+                work.terminal = true;
+                continue;
+            };
             work.fence_counter = next;
             let fence = Fence(next);
             work.holder = Some((consumer.clone(), fence, expires_at));
