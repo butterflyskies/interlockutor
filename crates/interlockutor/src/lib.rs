@@ -12,6 +12,12 @@
 //! - 0.2 to 0.3: [`PayloadError`] and [`Error`] are exhaustive. Callers whose
 //!   match already names every variant should remove an unreachable wildcard
 //!   arm; intentionally partial matches need no change.
+//! - 0.3 to 0.4: [`Error`] gained [`Error::StorePoisoned`]. Because `Error` is
+//!   exhaustive by the previous entry, a match written against 0.3 that names
+//!   every variant stops compiling until it names this one too. Reaching it
+//!   requires an injected [`Clock`] whose `now` panics — see the variant's docs
+//!   for why it is a typed fail-stop rather than a panic, and why authorization
+//!   is still answered ahead of it.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

@@ -3,8 +3,13 @@
 
 `cargo deny check` passes without examining the dev-only subtree at all, so its
 green result is not evidence about these crates. `docs/dev-dependency-licenses.md`
-records what was actually checked; this script is what stops that record from
-going quietly stale when the lockfile moves.
+records what was actually checked; this script is what catches that record going
+stale when the lockfile moves.
+
+Nothing runs it for you. No CI workflow invokes it and no gate depends on its
+exit code, so a lockfile change can land with the receipt already stale. The
+check happens when a human types one of the lines below and not otherwise;
+wiring it into CI is a separate decision, tracked separately.
 
     check-dev-dependency-licenses.py           verify, non-zero exit on drift
     check-dev-dependency-licenses.py --write   regenerate the table
@@ -32,7 +37,11 @@ import os
 import re
 import subprocess
 import sys
+import textwrap
+from collections import Counter
+from collections.abc import Iterable
 from pathlib import Path
+from typing import NoReturn
 
 ROOT = Path(__file__).resolve().parent.parent
 RECEIPT = ROOT / "docs" / "dev-dependency-licenses.md"
@@ -41,26 +50,53 @@ END = "<!-- END GENERATED: dev-dependency-licenses -->"
 LICENCE_FILE = re.compile(r"(?i)^(licen[cs]e|copying|unlicense|notice)")
 
 
-def die(message: str) -> "typing.NoReturn":  # noqa: F821
+def die(message: str) -> NoReturn:
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(2)
 
 
-def locked_packages() -> dict[str, str]:
+def name_version(crate: str) -> tuple[str, str]:
+    """Splits a `name@version` key. Crate names cannot contain `@`; versions can
+    contain `+` build metadata, so partition from the right."""
+    name, _, version = crate.rpartition("@")
+    return name, version
+
+
+def crate_list(crates: Iterable[str]) -> str:
+    return ", ".join(f"`{crate}`" for crate in sorted(crates, key=name_version))
+
+
+def wrap(text: str) -> str:
+    return textwrap.fill(
+        text, width=80, break_long_words=False, break_on_hyphens=False
+    )
+
+
+def locked_packages() -> set[str]:
+    """Every crate in the lockfile, as `name@version`.
+
+    Keyed by name *and* version throughout. A crate can appear at two versions,
+    and the two versions are two independent licence questions: one may be inside
+    cargo-deny's traversal while the other is not.
+    """
     lock = (ROOT / "Cargo.lock").read_text()
-    packages = {}
+    packages = set()
     for block in lock.split("[[package]]")[1:]:
         name = re.search(r'^name = "(.*)"$', block, re.M)
         version = re.search(r'^version = "(.*)"$', block, re.M)
         if name and version:
-            packages[name.group(1)] = version.group(1)
+            packages.add(f"{name.group(1)}@{version.group(1)}")
     if not packages:
         die("Cargo.lock parsed to nothing")
     return packages
 
 
 def non_dev_reachable() -> set[str]:
-    """Everything reachable without dev edges, plus the workspace members."""
+    """Everything reachable without dev edges, plus the workspace members.
+
+    Returned as `name@version`, because the question this answers is whether a
+    *specific* locked version ships, not whether some version of that crate does.
+    """
     out = subprocess.run(
         ["cargo", "tree", "-e", "no-dev", "--workspace", "--prefix", "none",
          "--format", "{p}"],
@@ -70,18 +106,32 @@ def non_dev_reachable() -> set[str]:
         die(f"cargo tree failed:\n{out.stderr.strip()}")
     reachable = set()
     for line in out.stdout.splitlines():
-        line = line.strip()
-        if line:
-            reachable.add(line.split()[0])
+        fields = line.split()
+        if len(fields) >= 2:
+            reachable.add(f"{fields[0]}@{fields[1].removeprefix('v')}")
+    if not reachable:
+        # An empty parse here is not an empty graph: the workspace members alone
+        # are always reachable. Left ungated it would silently satisfy the
+        # does-not-ship assertion below for every crate at once, which is the one
+        # failure this receipt exists to make loud.
+        die(
+            "cargo tree exited zero but parsed to nothing; the parse is wrong, "
+            "not the graph. Treating it as empty would vacuously pass the "
+            "assertion that none of the uncovered crates ships."
+        )
     return reachable
 
 
 def deny_covered() -> set[str]:
-    """Crates cargo-deny's licence traversal actually enumerates.
+    """Crate versions cargo-deny's licence traversal actually enumerates.
 
     `cargo deny list` prints `LICENSE (n): name@version, name@version, ...` for
-    every licence it encountered. Anything absent from that output is a crate the
-    licence check exited zero without evaluating.
+    every licence it encountered. Anything absent from that output is a crate
+    version the licence check exited zero without evaluating.
+
+    The `name@version` is kept whole. Reducing it to a bare name would let a
+    covered version vouch for an uncovered one of the same crate, which is
+    exactly the case this gap is supposed to surface.
     """
     out = subprocess.run(
         ["cargo", "deny", "list"], cwd=ROOT, capture_output=True, text=True,
@@ -98,7 +148,7 @@ def deny_covered() -> set[str]:
         for entry in listed.split(","):
             entry = entry.strip()
             if entry:
-                covered.add(entry.rsplit("@", 1)[0])
+                covered.add(entry)
     if not covered:
         die("cargo deny list produced no crates; the parse is wrong, not the gate")
     return covered
@@ -129,9 +179,16 @@ def describe(name: str, version: str) -> tuple[str, str]:
     return licence, ", ".join(files) or "none"
 
 
-def build_table() -> str:
-    packages = locked_packages()
-    uncovered = sorted(set(packages) - deny_covered())
+def build_section() -> str:
+    """The whole generated body: the derived claims as well as the table.
+
+    Counts and crate lists live in here rather than in the surrounding prose.
+    Outside the markers they are unreachable by this check by construction — the
+    table would be regenerated and the sentences describing it would not, leaving
+    a document that contradicts itself and still verifies clean.
+    """
+    covered = deny_covered()
+    uncovered = sorted(locked_packages() - covered, key=name_version)
     if not uncovered:
         die(
             "cargo deny list covers every locked crate. If that is genuinely "
@@ -141,24 +198,49 @@ def build_table() -> str:
     # The receipt claims none of this ships to a consumer of the published
     # crate. Assert it here rather than in prose.
     reachable = non_dev_reachable()
-    shipped = [name for name in uncovered if name in reachable]
+    shipped = [crate for crate in uncovered if crate in reachable]
     if shipped:
         die(
-            "these crates are outside cargo-deny's licence traversal *and* in "
-            f"the non-dev dependency graph: {', '.join(shipped)}. That is a "
-            "worse finding than a stale receipt — they ship to consumers and "
-            "nothing checks their licences."
+            "these crate versions are outside cargo-deny's licence traversal "
+            f"*and* in the non-dev dependency graph: {', '.join(shipped)}. That "
+            "is a worse finding than a stale receipt — they ship to consumers "
+            "and nothing checks their licences."
         )
-    dev_only = uncovered
     rows = [
         "| crate | version | declared license | licence files in package |",
         "| --- | --- | --- | --- |",
     ]
-    for name in dev_only:
-        version = packages[name]
+    declared = Counter()
+    for crate in uncovered:
+        name, version = name_version(crate)
         licence, files = describe(name, version)
+        declared[licence] += 1
         rows.append(f"| `{name}` | {version} | {licence} | {files} |")
-    return "\n".join(rows)
+    tally = ", ".join(
+        f"{count} × `{licence}`"
+        for licence, count in sorted(declared.items(), key=lambda kv: (-kv[1], kv[0]))
+    )
+    return "\n\n".join(
+        [
+            wrap(
+                f"`cargo deny list` enumerates {len(covered)} crate versions and "
+                f"no others: {crate_list(covered)}. Those, and only those, are "
+                "what a green `cargo deny check` is evidence about."
+            ),
+            wrap(
+                f"The {len(uncovered)} crate versions below are everything in "
+                "`Cargo.lock` that it does not enumerate — the set the licence "
+                "check exits zero without having evaluated."
+            ),
+            "\n".join(rows),
+            wrap(f"Declared licences across those {len(uncovered)}: {tally}."),
+            wrap(
+                "None of them ships. `cargo tree -e no-dev --workspace` reaches "
+                f"{len(reachable)} crate versions — {crate_list(reachable)} — "
+                "and not one row of the table above."
+            ),
+        ]
+    )
 
 
 def main() -> int:
@@ -169,8 +251,8 @@ def main() -> int:
 
     head, rest = text.split(BEGIN, 1)
     current, tail = rest.split(END, 1)
-    table = build_table()
-    updated = f"{head}{BEGIN}\n{table}\n{END}{tail}"
+    section = build_section()
+    updated = f"{head}{BEGIN}\n{section}\n{END}{tail}"
 
     if updated == text:
         print(f"ok: {RECEIPT.relative_to(ROOT)} matches the lockfile")
@@ -183,7 +265,7 @@ def main() -> int:
     print(
         f"{RECEIPT.relative_to(ROOT)} is stale: the dev-only dependency set has "
         "changed.\n\nRecorded:\n"
-        f"{current.strip()}\n\nActual:\n{table}\n\n"
+        f"{current.strip()}\n\nActual:\n{section}\n\n"
         "Re-verify the new licences against the allow list in deny.toml, then "
         "run with --write. `cargo deny check` does not cover these crates, so a "
         "green deny run is not a substitute for looking.",

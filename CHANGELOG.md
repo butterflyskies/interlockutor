@@ -276,15 +276,64 @@ The format is based on [Keep a Changelog], and this project adheres to
   also true, and it is why the first claim implies nothing about the third. The
   licences are acceptable — true, but established by looking, not by the gate.
   `scripts/check-dev-dependency-licenses.py` re-derives the uncovered set from
-  `cargo deny list` itself and fails when the receipt drifts from the lockfile,
-  so it goes stale loudly. `deny.toml` and the README carry the coverage caveat
-  where someone reading either would otherwise assume the gate had looked.
+  `cargo deny list` itself and exits non-zero when the receipt drifts from the
+  lockfile. It is run by hand: no CI workflow invokes it and nothing gates on its
+  exit code, so the receipt goes stale loudly for whoever runs the script and
+  silently for everyone else until someone does. Wiring it into CI is tracked
+  separately. `deny.toml` and the README carry the coverage caveat where someone
+  reading either would otherwise assume the gate had looked.
 
 - Added `scripts/kani.sh`. A bare `cargo kani` at the workspace root fails —
   Kani 0.67 pins rustc 1.93 and the crate's MSRV is 1.95 — and the working
   invocation, `cargo kani -p interlockutor-kani`, previously lived only in a doc
   comment. It is now a script, and the README says why the obvious command does
   not work rather than only what to type instead.
+
+- The migration notes on the crate root now cover `Error::StorePoisoned`. The
+  variant is listed in the changelog as breaking and `Error` is not
+  `#[non_exhaustive]`, so an exhaustive match written against 0.3.0 stops
+  compiling — which is precisely what the migration notes exist to say, and they
+  said nothing.
+
+- Every site that described `scripts/check-dev-dependency-licenses.py` as an
+  active mechanism now says it is run by hand. `deny.toml`, the README, this
+  file, and the script's own docstring asserted in the present tense that it
+  "keeps honest" or "makes the record go stale loudly"; `grep -rn "scripts/"
+  .github/` returns nothing, so nothing ran it. Only the receipt disclosed the
+  gap, two paragraphs after asserting the loudness. The compensating control is
+  real but manual, and now reads that way everywhere. Wiring it into CI is
+  tracked in #20 and is deliberately not done here.
+
+- The receipt's derived claims moved inside the generated markers. Its crate
+  counts, the covered-crate list, the `cargo tree -e no-dev` output, and the
+  per-licence tally sat in prose outside them, so `--write` on a lockfile change
+  would regenerate the table and leave the sentences describing it untouched —
+  a document that contradicts its own table and still verifies clean. Two were
+  already wrong: the licence tally said "Fourteen" where the table shows
+  thirteen (11 × `MIT OR Apache-2.0` plus 2 × `Apache-2.0 OR MIT`), and the
+  `cargo tree -e no-dev --workspace` output was given as six crates, omitting
+  the two workspace members the script counts. Both are now generated and cannot
+  disagree with the table.
+
+### Fixed (dev-dependency licence check)
+
+- `scripts/check-dev-dependency-licenses.py` keys crates by `name@version`
+  throughout. `locked_packages()` returned a name-to-version dict, so a crate
+  locked at two versions collapsed to one entry, and the covered set had its
+  versions stripped before the difference was taken. A crate present at both a
+  covered and an uncovered version therefore read as wholly covered: the
+  uncovered version got no row, produced no drift, and was never licence-checked.
+  With `bans.multiple-versions = "warn"` a duplicate can land without failing CI,
+  so nothing else would have caught it either. The same keying now applies to the
+  does-not-ship assertion, which asked whether *some* version of a crate was
+  reachable without dev edges rather than the one in the table.
+
+- The same script no longer treats an empty parse of `cargo tree` as an empty
+  dependency graph. `non_dev_reachable()` checked the exit status but not the
+  result, unlike its two siblings, which both `die` on a parse that yields
+  nothing. An empty set made the "none of these crates ships" assertion pass
+  vacuously for every row at once — the assertion guarding the one finding the
+  receipt calls materially worse than a stale table.
 
 ### Fixed (recipient adapter)
 

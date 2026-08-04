@@ -321,15 +321,17 @@ so on non-unix targets the call is a deliberate no-op.
 Apache-2.0
 
 Dependency licences are gated by `cargo deny check` in CI. That gate's licence
-traversal covers 13 crates and **does not reach the dev-only `trybuild`
-subtree**, so a green run says nothing about those 16 crates in either
-direction. They were enumerated and verified by hand against their packaged
-metadata, and the result is recorded in
+traversal **does not reach the dev-only `trybuild` subtree**, so a green run says
+nothing about those crates in either direction. They were enumerated and verified
+by hand against their packaged metadata, and the result — including exactly which
+crate versions the gate does and does not cover — is recorded in
 [`docs/dev-dependency-licenses.md`](docs/dev-dependency-licenses.md). All are
 permissive and already permitted by `deny.toml`; no policy change follows.
 
 `scripts/check-dev-dependency-licenses.py` re-derives that set from the gate's
-own output and fails if the receipt has drifted from the lockfile, so a new or
-bumped dev dependency makes the record go stale loudly.
+own output and exits non-zero if the receipt has drifted from the lockfile. It is
+run by hand — no CI workflow invokes it and nothing gates on its exit code — so a
+new or bumped dev dependency makes the record go stale loudly only for whoever
+runs it. Wiring it into CI is tracked separately.
 
 [sealed-traits]: https://predr.ag/blog/definitive-guide-to-sealed-traits-in-rust/
