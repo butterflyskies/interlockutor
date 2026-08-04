@@ -677,7 +677,7 @@ mod sealed {
 ///   blanket impl below already covers every `T: EventStore`, so a second impl
 ///   for any backend overlaps it and the compiler rejects the overlap. Guard:
 ///   `tests/ui/event_store_ext_cannot_be_substituted.rs`.
-/// - **[`sealed::Sealed`] holds nothing at all.** It is blanket-implemented over
+/// - **`sealed::Sealed` holds nothing at all.** It is blanket-implemented over
 ///   the same bound this trait already requires, so it is satisfied exactly when
 ///   `EventStore` is. Removing it from the supertrait list leaves all three
 ///   guards passing with byte-identical `.stderr`; removing the blanket impl
@@ -744,7 +744,7 @@ impl<T: EventStore + ?Sized> EventStoreExt for T {
 /// at it.
 ///
 /// **Authorization comes first and stays first.** Each method consults the
-/// [`Authorizer`] before calling [`MemoryStore::lock`], so a denied call returns
+/// [`Authorizer`] before calling `MemoryStore::lock`, so a denied call returns
 /// [`Error::Unauthorized`] whether or not the store is poisoned. A blanket
 /// "every later operation reports `StorePoisoned`" would be a stronger claim
 /// than the code makes, and the weaker one is the one worth having: a poisoned
