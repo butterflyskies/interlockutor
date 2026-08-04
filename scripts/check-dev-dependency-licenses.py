@@ -36,6 +36,7 @@ or a summary says.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 import subprocess
@@ -43,6 +44,7 @@ import sys
 import textwrap
 from collections import Counter
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
 
@@ -75,20 +77,45 @@ def wrap(text: str) -> str:
     )
 
 
-def locked_packages() -> set[str]:
-    """Every crate in the lockfile, as `name@version`.
+@dataclass(frozen=True)
+class LockedPackage:
+    name: str
+    version: str
+    source: str | None
+    checksum: str | None
+
+    @property
+    def key(self) -> str:
+        return f"{self.name}@{self.version}"
+
+
+def locked_packages() -> dict[str, LockedPackage]:
+    """Every crate in the lockfile, keyed by `name@version`.
 
     Keyed by name *and* version throughout. A crate can appear at two versions,
     and the two versions are two independent licence questions: one may be inside
     cargo-deny's traversal while the other is not.
+
+    Retains `source` and `checksum` so that `registry_dir` can resolve the exact
+    vendored artifact the lockfile selected rather than whichever same-named
+    directory `glob` finds first.
     """
     lock = (ROOT / "Cargo.lock").read_text()
-    packages = set()
+    packages: dict[str, LockedPackage] = {}
     for block in lock.split("[[package]]")[1:]:
         name = re.search(r'^name = "(.*)"$', block, re.M)
         version = re.search(r'^version = "(.*)"$', block, re.M)
-        if name and version:
-            packages.add(f"{name.group(1)}@{version.group(1)}")
+        if not (name and version):
+            continue
+        source = re.search(r'^source = "(.*)"$', block, re.M)
+        checksum = re.search(r'^checksum = "(.*)"$', block, re.M)
+        pkg = LockedPackage(
+            name=name.group(1),
+            version=version.group(1),
+            source=source.group(1) if source else None,
+            checksum=checksum.group(1) if checksum else None,
+        )
+        packages[pkg.key] = pkg
     if not packages:
         die("Cargo.lock parsed to nothing")
     return packages
@@ -174,20 +201,77 @@ def deny_covered() -> set[str]:
     return covered
 
 
-def registry_dir(name: str, version: str) -> Path:
+def _registry_slug(source: str | None) -> str | None:
+    """Extracts the registry slug from a lockfile source URL.
+
+    A source like `registry+https://github.com/rust-lang/crates.io-index`
+    corresponds to a subdirectory under `$CARGO_HOME/registry/src/` whose name
+    is derived from the URL. Cargo hashes the URL into a short slug
+    (`index.crates.io-<hash>`), but the slug is opaque and not reproduced here.
+    Instead this returns enough of the URL to identify the registry directory
+    via glob matching.
+    """
+    if source is None:
+        return None
+    # `registry+https://github.com/rust-lang/crates.io-index` → crates.io-index
+    # Custom registries may differ, but the domain/path suffix is still unique
+    # enough to disambiguate.
+    m = re.search(r'registry\+https?://[^/]+/(.+)', source)
+    if not m:
+        return None
+    # Take the last path component: `rust-lang/crates.io-index` → `crates.io-index`
+    return m.group(1).rstrip("/").rsplit("/", 1)[-1]
+
+
+def registry_dir(name: str, version: str, pkg: LockedPackage | None = None) -> Path:
     cargo_home = Path(os.environ.get("CARGO_HOME", Path.home() / ".cargo"))
-    matches = sorted((cargo_home / "registry" / "src").glob(f"*/{name}-{version}"))
-    if not matches:
+    all_matches = sorted(
+        (cargo_home / "registry" / "src").glob(f"*/{name}-{version}")
+    )
+    if not all_matches:
         die(
             f"{name} {version} is not vendored under {cargo_home}/registry/src. "
             "Run `cargo fetch` first; this script reads packaged metadata, not "
             "the crates.io index."
         )
-    return matches[0]
+
+    # When the lockfile records a source, narrow to the registry directory whose
+    # name contains the registry slug. Without this, two registries caching the
+    # same name/version yield ambiguous results and the first glob match wins —
+    # which may be the wrong artifact.
+    matches = all_matches
+    if pkg and pkg.source:
+        slug = _registry_slug(pkg.source)
+        if slug:
+            narrowed = [m for m in all_matches if slug in m.parent.name]
+            if narrowed:
+                matches = narrowed
+
+    result = matches[0]
+
+    # Verify the checksum when the lockfile provides one. The checksum in
+    # Cargo.lock is the SHA-256 of the `.crate` tarball, not of the unpacked
+    # directory, so a full verification would need the tarball. Instead, verify
+    # that the `.cargo-checksum.json` file in the unpacked directory agrees with
+    # the lockfile. Cargo writes this file on extraction and it contains the
+    # tarball checksum.
+    if pkg and pkg.checksum:
+        checksum_file = result / ".cargo-checksum.json"
+        if checksum_file.is_file():
+            content = checksum_file.read_text()
+            if pkg.checksum not in content:
+                die(
+                    f"{name} {version}: vendored artifact at {result} has a "
+                    f"checksum that does not match the lockfile "
+                    f"(expected {pkg.checksum[:16]}...). The cached package may "
+                    "be from a different registry or a stale download."
+                )
+
+    return result
 
 
-def describe(name: str, version: str) -> tuple[str, str]:
-    package = registry_dir(name, version)
+def describe(name: str, version: str, pkg: LockedPackage | None = None) -> tuple[str, str]:
+    package = registry_dir(name, version, pkg)
     manifest = (package / "Cargo.toml").read_text()
     declared = re.search(r'^license\s*=\s*"(.*)"$', manifest, re.M)
     if declared:
@@ -208,7 +292,8 @@ def build_section() -> str:
     a document that contradicts itself and still verifies clean.
     """
     covered = deny_covered()
-    uncovered = sorted(locked_packages() - covered, key=name_version)
+    locked = locked_packages()
+    uncovered = sorted(set(locked) - covered, key=name_version)
     if not uncovered:
         die(
             "cargo deny list covers every locked crate. If that is genuinely "
@@ -243,7 +328,7 @@ def build_section() -> str:
     declared = Counter()
     for crate in uncovered:
         name, version = name_version(crate)
-        licence, files = describe(name, version)
+        licence, files = describe(name, version, locked.get(crate))
         declared[licence] += 1
         rows.append(f"| `{name}` | {version} | {licence} | {files} |")
     tally = ", ".join(

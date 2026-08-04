@@ -127,6 +127,9 @@ class Case:
     rows: list[str] | None = None
     reaches: list[str] | None = None
     corrupt_receipt: bool = False
+    # Optional per-crate overrides: maps `name@version` to dict with keys like
+    # `source`, `checksum`, `licence`, `registry`.
+    pkg_meta: dict[str, dict[str, str]] = field(default_factory=dict)
 
 
 def deny_output(covered: list[str]) -> str:
@@ -166,27 +169,51 @@ def build_fixture(root: Path, case: Case, script: Path) -> None:
     (root / "scripts").mkdir(parents=True)
     shutil.copy(script, root / "scripts" / "check-dev-dependency-licenses.py")
 
-    packages = "\n".join(
-        f'[[package]]\nname = "{crate.rpartition("@")[0]}"\n'
-        f'version = "{crate.rpartition("@")[2]}"\n'
-        for crate in case.locked
+    lock_blocks = []
+    for crate in case.locked:
+        name, _, version = crate.rpartition("@")
+        meta = case.pkg_meta.get(crate, {})
+        block = (
+            f'[[package]]\nname = "{name}"\n'
+            f'version = "{version}"\n'
+        )
+        if "source" in meta:
+            block += f'source = "{meta["source"]}"\n'
+        if "checksum" in meta:
+            block += f'checksum = "{meta["checksum"]}"\n'
+        lock_blocks.append(block)
+    (root / "Cargo.lock").write_text(
+        f"version = 4\n\n{''.join(lock_blocks)}"
     )
-    (root / "Cargo.lock").write_text(f"version = 4\n\n{packages}")
 
     (root / "docs").mkdir()
     (root / "docs" / "dev-dependency-licenses.md").write_text(
         f"# fixture\n{BEGIN}\n{END}\n"
     )
 
-    registry = root / "cargo-home" / "registry" / "src" / "idx"
     for crate in case.locked:
         name, _, version = crate.rpartition("@")
+        meta = case.pkg_meta.get(crate, {})
+        # Determine registry directory name from source, or use default "idx"
+        reg_name = meta.get("registry", "idx")
+        registry = root / "cargo-home" / "registry" / "src" / reg_name
         package = registry / f"{name}-{version}"
         package.mkdir(parents=True, exist_ok=True)
+        licence = meta.get("licence", "MIT")
         (package / "Cargo.toml").write_text(
-            f'[package]\nname = "{name}"\nversion = "{version}"\nlicense = "MIT"\n'
+            f'[package]\nname = "{name}"\nversion = "{version}"\n'
+            f'license = "{licence}"\n'
         )
         (package / "LICENSE-MIT").write_text("MIT fixture text\n")
+        # Write .cargo-checksum.json if the lockfile has a checksum.
+        # `cached_checksum` overrides the stored checksum to simulate a
+        # cached package from a different registry.
+        if "checksum" in meta or "cached_checksum" in meta:
+            import json
+            stored = meta.get("cached_checksum", meta.get("checksum", ""))
+            (package / ".cargo-checksum.json").write_text(
+                json.dumps({"files": {}, "package": stored})
+            )
 
     (root / "deny.out").write_text(deny_output(case.covered))
     (root / "tree.host.out").write_text(tree_output(case.tree_host))
@@ -301,6 +328,30 @@ CASES = [
         tree_all=["foo@1.0.0"],
         exit_code=2,
         stderr_has=["produced no crates"],
+    ),
+    Case(
+        name="checksum-mismatch-from-wrong-registry-is-caught",
+        why=(
+            "two registries cache the same name/version with different licence "
+            "data. Without source/checksum verification the script inspects "
+            "whichever directory glob finds first, which may be the wrong "
+            "artifact. The lockfile source narrows the search, and the checksum "
+            "guards against a stale or substituted cache."
+        ),
+        locked=["foo@1.0.0", "bar@1.0.0"],
+        covered=["bar@1.0.0"],
+        tree_host=["bar@1.0.0"],
+        tree_all=["bar@1.0.0"],
+        exit_code=2,
+        stderr_has=["checksum", "does not match"],
+        pkg_meta={
+            "foo@1.0.0": {
+                "source": "registry+https://github.com/rust-lang/crates.io-index",
+                "checksum": "aaaa" * 16,
+                "cached_checksum": "bbbb" * 16,
+                "registry": "index.crates.io-aaa",
+            },
+        },
     ),
 ]
 
