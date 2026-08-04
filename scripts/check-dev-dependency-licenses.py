@@ -20,7 +20,10 @@ precisely the set the licence check exits zero without looking at, so the script
 cannot disagree with the gate about where the gap is.
 
 The set is separately asserted to be dev-only, by checking that none of it
-appears in `cargo tree -e no-dev`. Note that "dev-only" and "not covered by
+appears in `cargo tree -e no-dev --target all`. The target is pinned to `all`
+because `Cargo.lock` and `cargo deny` are both target-universal and `cargo
+tree` is not: host-scoped, the assertion cannot see a crate version reachable
+only behind `cfg(windows)`. Note that "dev-only" and "not covered by
 cargo-deny" are *not* the same set: `serde_derive`, `syn`, `quote`,
 `proc-macro2`, and `unicode-ident` reach the build only through a dev-enabled
 feature, yet cargo-deny does evaluate them under `all-features = true`. They are
@@ -96,10 +99,27 @@ def non_dev_reachable() -> set[str]:
 
     Returned as `name@version`, because the question this answers is whether a
     *specific* locked version ships, not whether some version of that crate does.
+
+    `--target all` because the two sets this is compared against are both
+    target-universal. `Cargo.lock` records every target's dependencies and
+    `cargo deny` traverses them all, but `cargo tree` defaults to the host
+    triple. Left host-scoped, a crate version reachable only behind
+    `cfg(windows)` is absent from this set, so the does-not-ship assertion below
+    answers "no" for a crate version that genuinely ships to Windows consumers
+    and the receipt prints "None of them ships" anyway. That is a fail-open, and
+    the host running the check decides which crates it hides.
+
+    The flag widens the set beyond target gating: `--target all` also drops
+    resolver-v2's per-target feature de-unification, so a feature enabled only
+    by a dev-dependency (here `serde/derive`) unifies into the normal graph and
+    pulls its subtree in. That over-approximates. It over-approximates in the
+    safe direction — a larger reachable set can only make the assertion below
+    harder to satisfy, never easier — so the generated sentence reports what the
+    command reaches rather than claiming all of it ships.
     """
     out = subprocess.run(
         ["cargo", "tree", "-e", "no-dev", "--workspace", "--prefix", "none",
-         "--format", "{p}"],
+         "--format", "{p}", "--target", "all"],
         cwd=ROOT, capture_output=True, text=True, check=False,
     )
     if out.returncode != 0:
@@ -197,6 +217,16 @@ def build_section() -> str:
         )
     # The receipt claims none of this ships to a consumer of the published
     # crate. Assert it here rather than in prose.
+    #
+    # Know what this assertion is worth. cargo-deny traverses with
+    # `targets = []`, `all-features = true`, and no dev edges; so does the
+    # command below. While those two agree, `reachable` equals `covered`,
+    # `uncovered` is `locked - covered`, and the intersection is empty by
+    # construction — the check cannot fire for any lockfile. That was true
+    # before the target was pinned too, the host set being a strict subset of
+    # the covered one. It is a detector for the two traversals *diverging*,
+    # which a narrowed `targets` in deny.toml or a dependency kind only one of
+    # them walks would cause. It is not what licence-clears the table.
     reachable = non_dev_reachable()
     shipped = [crate for crate in uncovered if crate in reachable]
     if shipped:
@@ -235,9 +265,17 @@ def build_section() -> str:
             "\n".join(rows),
             wrap(f"Declared licences across those {len(uncovered)}: {tally}."),
             wrap(
-                "None of them ships. `cargo tree -e no-dev --workspace` reaches "
-                f"{len(reachable)} crate versions — {crate_list(reachable)} — "
-                "and not one row of the table above."
+                "None of them ships. `cargo tree -e no-dev --workspace --target "
+                f"all` reaches {len(reachable)} crate versions — "
+                f"{crate_list(reachable)} — and not one row of the table above. "
+                "That set is an over-approximation of what ships, not a list of "
+                "it: `--target all` switches off the resolver's feature "
+                "de-unification wholesale, so a subtree reached only through a "
+                "dev-enabled feature appears here too. It is the right side to "
+                "err on, because every crate it adds is one more the table is "
+                "checked against — but see the caveat above, which is that this "
+                "set and the covered set are currently identical and so the "
+                "check between them cannot fire."
             ),
         ]
     )

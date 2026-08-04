@@ -53,18 +53,40 @@ closed, and this receipt is the thing that closes it in the meantime.
   no drift, and no examination.
 
   "Dev-only" and "not covered by `cargo-deny`" are **not** the same set, and
-  conflating them overstates the gap. Compare the two generated lists below: some
-  crates `cargo deny list` enumerates are absent from `cargo tree -e no-dev`,
-  because they reach the build only through the `derive` feature that the
-  dev-dependency on `serde` enables — yet `cargo-deny` does evaluate them under
-  `all-features = true`. They are covered, so they are not in the table.
-- **Nothing below ships.** Every row in the table is separately checked to be
-  absent from `cargo tree -e no-dev --workspace`, whose full output is generated
-  below alongside it. The check script fails loudly if a crate version is ever
-  both outside `cargo-deny`'s traversal and inside the shipping graph, which
-  would be a materially worse finding than a stale table — and it refuses to
-  evaluate that check against an empty parse of `cargo tree`, which would satisfy
-  it vacuously for every row at once.
+  conflating them overstates the gap. `serde_derive`, `syn`, `quote`,
+  `proc-macro2`, and `unicode-ident` reach the build only through the `derive`
+  feature that the *dev*-dependency on `serde` enables, yet `cargo-deny` does
+  evaluate them under `all-features = true`. They are covered, so they are not in
+  the table — and both generated lists below name them, because `--target all`
+  switches off the resolver's feature de-unification wholesale, which unifies the
+  dev-enabled `derive` feature into the normal graph along with everything else.
+  The feature is gated by dependency kind, not by target; the flag is not
+  selective about which dimension it collapses.
+- **Nothing below ships.** Every row in the table is checked to be absent from
+  `cargo tree -e no-dev --workspace --target all`, whose full output is generated
+  below alongside it. The target is pinned to `all` because `Cargo.lock` and
+  `cargo-deny` are both target-universal and `cargo tree` is not: scoped to the
+  host, that check cannot see a crate version reachable only behind
+  `cfg(windows)`, and would report it as not shipping while it shipped to every
+  Windows consumer. The script fails loudly if a crate version is ever both
+  outside `cargo-deny`'s traversal and inside the shipping graph, which would be
+  a materially worse finding than a stale table — and it refuses to evaluate that
+  check against an empty parse of `cargo tree`, which would satisfy it vacuously
+  for every row at once.
+
+  **This check cannot currently fire, and that is not the same as it passing.**
+  `cargo-deny` traverses with `targets = []`, `all-features = true`, and without
+  dev edges; `cargo tree -e no-dev --target all` traverses the same way. The two
+  generated lists below are consequently the same 13 crate versions, and while
+  they agree the check is unfireable by construction: the table is `Cargo.lock`
+  minus the covered set, so it cannot intersect a reachable set equal to that
+  covered set. It could not fire before the target was pinned either — the host
+  reached 8, a strict subset of the same 13. What the check catches is the two
+  traversals **diverging**: narrowing `targets` in `deny.toml`, or a dependency
+  kind that one walks and the other does not, would let a crate be both in the
+  table and reachable. It is a consistency check between two views of one
+  traversal, not a second independent source of evidence, and it is not what
+  licence-clears the table. Claim 3 above is.
 - **Declared licence** is the `license` field of the packaged `Cargo.toml`.
 - **Licence texts** are the licence files shipped in the same package, read at
   the exact versions recorded in the table below. All are full texts, not stubs;
@@ -126,10 +148,18 @@ enumerate — the set the licence check exits zero without having evaluated.
 Declared licences across those 16: 11 × `MIT OR Apache-2.0`, 2 × `Apache-2.0 OR
 MIT`, 2 × `Unlicense OR MIT`, 1 × `MIT`.
 
-None of them ships. `cargo tree -e no-dev --workspace` reaches 8 crate versions
-— `interlockutor@0.3.0`, `interlockutor-kani@0.3.0`, `itoa@1.0.18`,
-`memchr@2.8.3`, `serde@1.0.228`, `serde_core@1.0.228`, `serde_json@1.0.150`,
-`zmij@1.0.21` — and not one row of the table above.
+None of them ships. `cargo tree -e no-dev --workspace --target all` reaches 13
+crate versions — `interlockutor@0.3.0`, `interlockutor-kani@0.3.0`,
+`itoa@1.0.18`, `memchr@2.8.3`, `proc-macro2@1.0.106`, `quote@1.0.46`,
+`serde@1.0.228`, `serde_core@1.0.228`, `serde_derive@1.0.228`,
+`serde_json@1.0.150`, `syn@2.0.118`, `unicode-ident@1.0.24`, `zmij@1.0.21` — and
+not one row of the table above. That set is an over-approximation of what ships,
+not a list of it: `--target all` switches off the resolver's feature
+de-unification wholesale, so a subtree reached only through a dev-enabled
+feature appears here too. It is the right side to err on, because every crate it
+adds is one more the table is checked against — but see the caveat above, which
+is that this set and the covered set are currently identical and so the check
+between them cannot fire.
 <!-- END GENERATED: dev-dependency-licenses -->
 
 `winapi-util`, `windows-link`, and `windows-sys` are `termcolor`'s

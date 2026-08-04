@@ -335,6 +335,57 @@ The format is based on [Keep a Changelog], and this project adheres to
   vacuously for every row at once — the assertion guarding the one finding the
   receipt calls materially worse than a stale table.
 
+- The does-not-ship assertion now asks `cargo tree` about every target, not just
+  the host. `Cargo.lock` records every target's dependencies and `cargo deny`
+  traverses them all; `cargo tree` defaults to the host triple, so the three
+  components disagreed about which universe they were describing. Keying that
+  assertion by `name@version` made the mismatch reachable: a crate whose versions
+  split by target — one covered and built on Linux, one behind `cfg(windows)` and
+  outside `cargo-deny`'s traversal — is asked about by exact key and answered
+  from a Linux-only set, so the absent Windows version reads as not shipping and
+  the receipt prints "None of them ships" while it ships to every Windows
+  consumer. No such split exists in this lockfile — the change is prophylactic,
+  not a repair of an observed miss. `--target all` puts the reachable set in the
+  same universe as the other two. It over-approximates, because `--target all`
+  switches off the resolver's feature de-unification wholesale and so pulls in a
+  subtree reached only through a dev-enabled feature; that direction can only
+  make the assertion harder to satisfy, and the generated sentence now says which
+  set it is reporting. The generated table's 16 rows are byte-identical across
+  the change; the reachable set it is checked against goes from 8 crate versions
+  to 13.
+
+- The receipt now discloses that its does-not-ship check cannot fire. `cargo
+  deny list` covers 13 crate versions and `cargo tree -e no-dev --workspace
+  --target all` reaches the same 13; the table is `Cargo.lock` minus the covered
+  set, so it cannot intersect a reachable set equal to that set. The check was
+  equally unfireable before, the host's 8 being a strict subset of the same 13 —
+  pinning the target did not cause this, it made the two sets coincide exactly.
+  The receipt described the check as "separately checked", which reads as a
+  second independent source of evidence about what ships; it is a consistency
+  check between two views of one traversal, and it earns its keep only by
+  catching those two diverging. Said plainly now, next to the claim it qualifies,
+  because a compensating control that overstates itself is the failure this
+  document exists to avoid.
+
+- Added `scripts/test-check-dev-dependency-licenses.py`, six fixture cases
+  driving the licence script against a stubbed `cargo`, a stub `CARGO_HOME`, and
+  a synthetic lockfile. Two vary reachability against a fixed lockfile, which no
+  previous fixture did: a crate version that is both uncovered and exactly
+  reachable must fail, and the same lockfile with only the *other* version
+  reachable must pass. Each guard was reverted individually against the suite and
+  shown to stop being detected — dropping `--target all` turns the first of those
+  into a silent pass, which is the fail-open above, reproduced. Nothing runs this
+  suite either; like the script it tests, it is invoked by hand.
+
+- `scripts/__pycache__/` is no longer tracked, and `__pycache__/` is ignored.
+  `jj` snapshots the working copy rather than a staging area, so bytecode left
+  beside the script was committed with it and nothing offered a chance to
+  decline. Running the script does not produce that bytecode — CPython writes no
+  `.pyc` for `__main__` — but importing it or running `python -m py_compile` on
+  it does, which is what any tooling that inspects it will do. The ignore stops
+  the recurrence; it does not untrack, which is why the file is removed here as
+  well.
+
 ### Fixed (recipient adapter)
 
 - The scavenger no longer deletes staging files whose age cannot be established.
