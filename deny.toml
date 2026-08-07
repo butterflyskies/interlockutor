@@ -10,6 +10,17 @@ all-features = true
 ignore = []
 
 # --- Licenses -------------------------------------------------------------
+#
+# Coverage note: this check does NOT evaluate the dev-only `trybuild` subtree.
+# `cargo deny list` enumerates the covered crate versions; everything else in
+# Cargo.lock is never examined, so a passing run is not evidence about their
+# licences in either direction. Those were verified by hand against their
+# packaged metadata and recorded in docs/dev-dependency-licenses.md.
+# scripts/check-dev-dependency-licenses.py re-checks that record against the
+# lockfile, but it is run by hand and is not wired into CI — no job invokes it
+# and nothing gates on its exit code, so a lockfile change can land with the
+# record stale. Widening the traversal is a policy change and is tracked
+# separately; do not cite this file's green result as having cleared them.
 [licenses]
 allow = [
     "MIT",

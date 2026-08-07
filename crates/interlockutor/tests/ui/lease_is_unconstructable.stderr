@@ -1,0 +1,13 @@
+error[E0451]: fields `event`, `owner`, `fence` and `expires_at` of struct `Lease` are private
+  --> tests/ui/lease_is_unconstructable.rs:12:9
+   |
+11 |     Lease {
+   |     ----- in this type
+12 |         event,
+   |         ^^^^^ private field
+13 |         owner: holder,
+   |         ^^^^^ private field
+14 |         fence: Fence(1),
+   |         ^^^^^ private field
+15 |         expires_at: u64::MAX,
+   |         ^^^^^^^^^^ private field
