@@ -1,0 +1,12 @@
+[package]
+name = "interlockutor-kani"
+description = "Kani proofs for Interlockutor's semantic kernel"
+version.workspace = true
+edition = "2021"
+rust-version = "1.93"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

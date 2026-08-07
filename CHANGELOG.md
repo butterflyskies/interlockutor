@@ -5,6 +5,16 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog], and this project adheres to
 [Semantic Versioning].
 
+## [Unreleased]
+
+### Changed
+
+- Replaced the leased-work transition internals with a small semantic kernel
+  shared verbatim with an unpublished Kani proof crate. Fence exhaustion now
+  leaves an item permanently unclaimable instead of panicking, and lease
+  timestamp overflow is rejected as an invalid duration. The product MSRV
+  remains 1.95; the proof adapter declares Rust 1.93 for Kani 0.67.
+
 ## [0.3.0] - 2026-07-24
 
 ### Changed
